@@ -99,12 +99,14 @@ MOTOR_SRCS = test_motor.c \
              ../../foc/motor/motor.c
 
 motor-float:
-	$(CC) $(CFLAGS) -DFOC_NUMERIC_FLOAT=1 $(MOTOR_SRCS) \
+	$(CC) $(CFLAGS) -DPERFC_TEST_CRITICAL_HOOKS=1 \
+	    -DFOC_NUMERIC_FLOAT=1 $(MOTOR_SRCS) \
 	    -lm -o motor_float
 	./motor_float
 
 motor-fixed:
-	$(CC) $(CFLAGS) -DFOC_NUMERIC_FIXED=1 $(MOTOR_SRCS) \
+	$(CC) $(CFLAGS) -DPERFC_TEST_CRITICAL_HOOKS=1 \
+	    -DFOC_NUMERIC_FIXED=1 $(MOTOR_SRCS) \
 	    -lm -o motor_fixed
 	./motor_fixed
 

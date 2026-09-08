@@ -264,7 +264,7 @@ vpath %.S $(sort $(dir $(ASM_SOURCES)))
 
 # 针对高频控制步相关的密集计算模块强制启用 -O2 优化
 $(BUILD_DIR)/foc_%.o: CFLAGS += -O2
-$(BUILD_DIR)/motor_control.o: CFLAGS += -O2
+$(BUILD_DIR)/motor.o: CFLAGS += -O2
 
 $(BUILD_DIR)/%.o: %.c | $(BUILD_DIR)
 	$(CC) -c $(CFLAGS) -o $@ $<

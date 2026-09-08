@@ -180,5 +180,12 @@ void haltim1_StartAdcTrigger(void)
 
 void haltim1_Stop(void)
 {
-    LL_TIM_DisableAllOutputs(TIM1);
+    /* 只关三相功率输出（CH1-3），保留 CH4 + MOE：
+       高频 FOC ISR 由 OC4REF→ADC 注入触发驱动，若整体关 MOE 会连
+       ADC 触发一起停掉，导致后续 Start 的邮箱命令无人消费（电机路径
+       启动死锁）。CH1-3 关断 + MOE 保持与 ADC 校准阶段完全一致，
+       为已验证的安全关断状态。 */
+    LL_TIM_CC_DisableChannel(TIM1, LL_TIM_CHANNEL_CH1 | LL_TIM_CHANNEL_CH1N);
+    LL_TIM_CC_DisableChannel(TIM1, LL_TIM_CHANNEL_CH2 | LL_TIM_CHANNEL_CH2N);
+    LL_TIM_CC_DisableChannel(TIM1, LL_TIM_CHANNEL_CH3 | LL_TIM_CHANNEL_CH3N);
 }

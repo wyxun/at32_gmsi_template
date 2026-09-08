@@ -23,24 +23,9 @@ typedef enum {
     FOC_APP_ANGLE_ENCODER,
 } foc_app_angle_source_e;
 
-typedef enum {
-    FOC_APP_ENCODER_CAL_IDLE = 0,
-    FOC_APP_ENCODER_CAL_ALIGNING,
-    FOC_APP_ENCODER_CAL_CAPTURE,
-} foc_app_encoder_cal_state_e;
-
-typedef struct {
-    foc_run_state_e eState;
-    foc_command_e ePendingCommand;
-    uint32_t wFaults;
-    uint16_t hwCalibrationTicks;
-    bool bPwmEnabled;
-} foc_app_lifecycle_t;
-
 typedef struct {
     foc_angle_t tElectricalZero;
     foc_angle_t tOpenLoopAngle;
-    foc_scalar_t qMechanicalSpeed;
     foc_scalar_t qOpenLoopSpeed;
     foc_scalar_t qOpenLoopTargetSpeed;
     uint32_t wCurrentAlignTicks;
@@ -53,22 +38,12 @@ typedef struct {
 } foc_app_position_t;
 
 typedef struct {
-    foc_app_encoder_cal_state_e eState;
-    uint32_t wStartedMs;
-} foc_app_encoder_calibration_t;
-
-typedef struct {
     uint32_t wIsrMaxCycles;
     uint32_t wIsrSamples;
     uint32_t wLastPollMs;
     uint16_t hwConsecutivePollFails;
     uint32_t wLastReportMs;
     uint8_t chRunPt;
-    foc_angle_t tElectricalAngle;
-    foc_scalar_t qElectricalSpeed;
-    foc_scalar_t qIu;
-    foc_scalar_t qIv;
-    foc_scalar_t qIw;
 #if defined(FOC_NUMERIC_FLOAT)
     float fElectricalAngleTurns;
     float fEncoderMechanicalTurns;
@@ -95,19 +70,10 @@ typedef struct {
 
 typedef struct {
     modus_base_t *ptBase;
-    foc_core_state_t tCore;
-    foc_pid_t tSpeedPid;
-    const foc_pwm_ops_t *ptPwmOps;
-    const foc_adc_ops_t *ptAdcOps;
     foc_sensor_t tSensor;           /**< 位置/速度传感器接口 */
-    foc_adc_calib_t tCalibration;
-    foc_core_command_t tCommand;
-    foc_app_lifecycle_t tLifecycle;
     foc_app_position_t tPosition;
-    foc_app_encoder_calibration_t tEncoderCalibration;
     foc_app_diagnostics_t tDiagnostics;
     motor_t tMotor;
-    bool bMotorControlPath;
 } foc_app_t;
 
 typedef struct {

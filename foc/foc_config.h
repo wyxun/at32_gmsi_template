@@ -63,6 +63,19 @@
 #error "FOC_HF_PROFILE_LEVEL must be 0, 1, or 2"
 #endif
 
+/* Target-specific DWT timing contract. A zero deadline disables reporting. */
+#ifndef FOC_HF_DEADLINE_CYCLES
+#define FOC_HF_DEADLINE_CYCLES       0U
+#endif
+
+#ifndef FOC_HF_BASELINE_MAX_CYCLES
+#define FOC_HF_BASELINE_MAX_CYCLES   0U
+#endif
+
+#ifndef FOC_HF_SHADOW_MAX_CYCLES
+#define FOC_HF_SHADOW_MAX_CYCLES     0U
+#endif
+
 #include "foc_trig.h"
 
 #endif /* __FOC_CONFIG_H__ */

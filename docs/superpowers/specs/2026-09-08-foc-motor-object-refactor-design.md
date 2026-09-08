@@ -1,7 +1,7 @@
 # FOC Motor 对象重构设计草案
 
 > 日期：2026-09-08  
-> 状态：已获准进入实施；独立 Motor、Core 去重、AS5600 provider，以及三种控制模式 wrapper 已落地，完整编码器零位对齐仍由 App 的非阻塞服务承载，待专项状态机回归后再下沉。
+> 状态：已获准进入实施；独立 Motor、Core 去重、AS5600 provider，以及三种控制模式 wrapper 已落地。编码器零位对齐已于 2026-09-09 下沉到 Motor（`MOTOR_STATE_POSITION_CAL` + `motor_RequestPositionCalibration()`，App 位置 provider 实现 `fnCaptureElectricalZero`，旧 App 标定服务删除），主机测试与 G431 固件构建通过，待台架回归确认 offset 重复性与速度闭环基线。
 
 ## 1. 目标
 

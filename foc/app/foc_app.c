@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "foc_app.h"
+#include "foc_config.h"
 #include "foc_port.h"
 #include "foc_core.h"
 #include "foc_encoder.h"
@@ -34,22 +35,11 @@
 #define FOC_APP_HF_PERIOD_S            0.00005f
 #define FOC_APP_CURRENT_ALIGN_TICKS    20000U
 #define FOC_APP_OPEN_LOOP_ACCEL        0.25f
-#define FOC_APP_ENCODER_CAL_MS         1500U
-/* 编码器零位标定的对齐电流 (pu)：Id 定电流、Iq=0，比 Vd 电压对齐更确定
- * （对齐力矩 T∝Id×ψ，不依赖 R/L/母线电压）。0.10 pu ≈ 80 mA。 */
+/* 编码器零位标定对齐保持拍数：1500 ms @ 20 kHz。对齐电流 Id 定电流、
+ * Iq=0，力矩 T∝Id×ψ 不依赖 R/L/母线电压散布，比 Vd 电压对齐更确定。 */
+#define FOC_APP_ENCODER_CAL_TICKS      30000U
 #define FOC_APP_ENC_CAL_ID_ALIGN       0.10f
 
-#define FOC_FAULT_CALIBRATION_TIMEOUT  (1UL << 0)
-#define FOC_FAULT_CALIBRATION          (1UL << 1)
-#define FOC_FAULT_CURRENT_SAMPLE       (1UL << 2)
-#define FOC_FAULT_ANGLE                (1UL << 3)
-#define FOC_FAULT_MATH                 (1UL << 4)
-#define FOC_FAULT_DUTY_COMMIT          (1UL << 5)
-#define FOC_FAULT_PWM_ENABLE           (1UL << 6)
-#define FOC_FAULT_ENCODER_CAL          (1UL << 7)
-#define FOC_FAULT_STATE                (1UL << 8)
-
-static void foc_app_SpeedLoop(foc_app_t *ptThis);
 static void foc_app_CurrentStartupStep(foc_app_t *ptThis);
 
 #if defined(MODUS_ENABLE) && MODUS_ENABLE
@@ -152,15 +142,63 @@ static void foc_app_MotorPositionReset(void *pContext)
 static int32_t foc_app_MotorPositionSlowUpdate(void *pContext)
 {
     foc_app_t *ptThis = (foc_app_t *)pContext;
+    int32_t nResult = 0;
+#if defined(MODUS_ENABLE) && MODUS_ENABLE
+    uint32_t wNow = 0U;
+    uint32_t wIntervalMs = 1U;
 
     if (ptThis == NULL) {
         return -1;
     }
+    /* Motor 路径下的慢速轮询必须与旧 EncoderPoll 相同：限速 1 kHz，
+       失败退避 100 ms，避免随 Run 节奏反复访问 I2C 总线。 */
+    wNow = (uint32_t)get_system_ms();
+    if (ptThis->tDiagnostics.hwConsecutivePollFails > 0U) {
+        wIntervalMs = 100U;
+    }
+    if ((uint32_t)(wNow - ptThis->tDiagnostics.wLastPollMs) <
+        wIntervalMs) {
+        return 0;
+    }
+    ptThis->tDiagnostics.wLastPollMs = wNow;
+#else
+    if (ptThis == NULL) {
+        return -1;
+    }
+#endif
     if (ptThis->tSensor.ptOps == NULL ||
         ptThis->tSensor.ptOps->fnUpdate == NULL) {
         return 0;
     }
-    return ptThis->tSensor.ptOps->fnUpdate(ptThis->tSensor.pPriv);
+    nResult = ptThis->tSensor.ptOps->fnUpdate(ptThis->tSensor.pPriv);
+    if (nResult < 0) {
+#if defined(MODUS_ENABLE) && MODUS_ENABLE
+        if (ptThis->tDiagnostics.hwConsecutivePollFails < UINT16_MAX) {
+            ptThis->tDiagnostics.hwConsecutivePollFails++;
+        }
+#endif
+        return nResult;
+    }
+#if defined(MODUS_ENABLE) && MODUS_ENABLE
+    ptThis->tDiagnostics.hwConsecutivePollFails = 0U;
+#if defined(FOC_NUMERIC_FLOAT)
+    {
+        foc_angle_t tMechanicalAngle = {0U};
+        foc_scalar_t qMechanicalSpeed = FOC_ZERO;
+        bool bValid = false;
+
+        /* EncMech 波形只读缓存的机械角快照，不发起总线访问。 */
+        if (ptThis->tSensor.ptOps->fnRead != NULL &&
+            ptThis->tSensor.ptOps->fnRead(
+                ptThis->tSensor.pPriv, &tMechanicalAngle,
+                &qMechanicalSpeed, &bValid) == FOC_RESULT_OK && bValid) {
+            ptThis->tDiagnostics.fEncoderMechanicalTurns =
+                foc_angle_to_turns(tMechanicalAngle);
+        }
+    }
+#endif
+#endif
+    return 0;
 }
 
 static foc_result_t foc_app_MotorPositionRead(
@@ -214,59 +252,74 @@ static foc_result_t foc_app_MotorPositionRead(
     return FOC_RESULT_OK;
 }
 
+/**
+ * @brief Capture the encoder position as the electrical zero.
+ * @param pContext App object serving as the position provider context.
+ * @return FOC_RESULT_OK after storing the zero; SAFETY when the
+ *         encoder sample is not valid, DISABLED when it cannot read.
+ * @note The rotor is held by the alignment current when Motor calls
+ *       this operation; only the cached sensor sample is consumed.
+ */
+static foc_result_t foc_app_MotorPositionCaptureElectricalZero(
+    void *pContext)
+{
+    foc_app_t *ptThis = (foc_app_t *)pContext;
+    foc_angle_t tMechanicalAngle = {0U};
+    foc_scalar_t qMechanicalSpeed = FOC_ZERO;
+    bool bValid = false;
+    float fMechanicalTurns = 0.0f;
+
+    if (ptThis == NULL) {
+        return FOC_RESULT_NULL;
+    }
+    if (ptThis->tSensor.ptOps == NULL ||
+        ptThis->tSensor.ptOps->fnRead == NULL) {
+        return FOC_RESULT_DISABLED;
+    }
+    if (ptThis->tSensor.ptOps->fnRead(
+            ptThis->tSensor.pPriv, &tMechanicalAngle,
+            &qMechanicalSpeed, &bValid) != FOC_RESULT_OK || !bValid) {
+        return FOC_RESULT_SAFETY;
+    }
+    fMechanicalTurns = foc_angle_to_turns(tMechanicalAngle);
+    ptThis->tPosition.tElectricalZero = foc_angle_from_turns(
+        -fMechanicalTurns * (float)ptThis->tPosition.chPolePairs);
+    ptThis->tPosition.bEncoderCalibrated = true;
+#if defined(MODUS_ENABLE) && MODUS_ENABLE
+    MLOGF(I, "encoder cal: mech=%.4f turn offset=%.4f turn\r\n",
+          (double)fMechanicalTurns,
+          (double)foc_angle_to_turns(
+              ptThis->tPosition.tElectricalZero));
+#endif
+    return FOC_RESULT_OK;
+}
+
 static const motor_position_ops_t s_tFocAppMotorPositionOps = {
     .fnInit = foc_app_MotorPositionInit,
     .fnReset = foc_app_MotorPositionReset,
     .fnSlowUpdate = foc_app_MotorPositionSlowUpdate,
     .fnObserve = NULL,
     .fnRead = foc_app_MotorPositionRead,
-    .fnCaptureElectricalZero = NULL,
+    .fnCaptureElectricalZero =
+        foc_app_MotorPositionCaptureElectricalZero,
 };
 
+/**
+ * @brief Keep the float electrical-angle snapshot used by the waveform.
+ * @param ptThis FOC application object.
+ * @return None.
+ * @note 状态/电流/电压均直接读 Motor，此处只维护波形需要的角度换算。
+ */
 static void foc_app_SyncMotorView(foc_app_t *ptThis)
 {
-    motor_feedback_t tFeedback = {0};
-    motor_status_t tStatus = {0};
-
-    if (ptThis == NULL || !ptThis->bMotorControlPath) {
+    if (ptThis == NULL) {
         return;
     }
-    (void)motor_GetFeedback(&ptThis->tMotor, &tFeedback);
-    (void)motor_GetStatus(&ptThis->tMotor, &tStatus);
-    ptThis->tCore.tCurrent = tFeedback.tCurrent;
-    ptThis->tCore.tVoltage = tFeedback.tVoltage;
-    ptThis->tCore.tDuty = tFeedback.tDuty;
-    ptThis->tDiagnostics.tElectricalAngle =
-        tFeedback.tPosition.tElectricalAngle;
-    ptThis->tDiagnostics.qElectricalSpeed =
-        tFeedback.tPosition.qElectricalSpeed;
-    ptThis->tPosition.qMechanicalSpeed =
-        tFeedback.tPosition.qElectricalSpeed /
-        FOC_SCALAR((float)ptThis->tPosition.chPolePairs);
-    ptThis->tCommand = tStatus.tCommand;
-    ptThis->tCalibration = ptThis->tMotor.tAdcCalibration;
-    ptThis->tLifecycle.wFaults = tStatus.wFaults;
-    ptThis->tLifecycle.bPwmEnabled = tStatus.bPwmEnabled;
-    switch (tStatus.eLifecycle) {
-    case MOTOR_STATE_INITIALIZING:
-        ptThis->tLifecycle.eState = FOC_STATE_IDLE;
-        break;
-    case MOTOR_STATE_IDLE:
-        ptThis->tLifecycle.eState = FOC_STATE_IDLE;
-        break;
-    case MOTOR_STATE_CALIBRATING:
-        ptThis->tLifecycle.eState = FOC_STATE_CALIBRATING;
-        break;
-    case MOTOR_STATE_RUNNING:
-        ptThis->tLifecycle.eState = FOC_STATE_RUNNING;
-        break;
-    case MOTOR_STATE_FAULT:
-        ptThis->tLifecycle.eState = FOC_STATE_FAULT;
-        break;
-    default:
-        ptThis->tLifecycle.eState = FOC_STATE_FAULT;
-        break;
-    }
+#if defined(FOC_NUMERIC_FLOAT)
+    ptThis->tDiagnostics.fElectricalAngleTurns =
+        foc_angle_to_turns(
+            ptThis->tMotor.tPositionFeedback.tElectricalAngle);
+#endif
 }
 
 /**
@@ -288,22 +341,6 @@ static bool foc_app_EncoderReady(const foc_app_t *ptThis)
 }
 
 /**
- * @brief Stop the power stage before publishing a software fault.
- * @param ptThis FOC application object.
- * @param wFault Fault bit to latch.
- * @return None.
- */
-static void foc_app_EnterFault(foc_app_t *ptThis, uint32_t wFault)
-{
-    if (ptThis != NULL) {
-        ptThis->ptPwmOps->fnEmergencyStop(NULL);
-        ptThis->tLifecycle.bPwmEnabled = false;
-        ptThis->tLifecycle.wFaults |= wFault;
-        ptThis->tLifecycle.eState = FOC_STATE_FAULT;
-    }
-}
-
-/**
  * @brief Validate a requested control mode.
  * @param eMode Control mode to check.
  * @return true for a supported mode.
@@ -311,177 +348,6 @@ static void foc_app_EnterFault(foc_app_t *ptThis, uint32_t wFault)
 static bool foc_app_ModeValid(foc_control_mode_e eMode)
 {
     return eMode <= FOC_MODE_SPEED;
-}
-
-/**
- * @brief Publish a command atomically for the real-time consumer.
- * @param ptThis FOC application object.
- * @param eCommand Command to publish.
- * @return None.
- */
-static void foc_app_PostCommand(foc_app_t *ptThis,
-                                foc_command_e eCommand)
-{
-    uintptr_t wState = 0U;
-
-    if (ptThis != NULL) {
-        wState = perfc_port_disable_global_interrupt();
-        ptThis->tLifecycle.ePendingCommand = eCommand;
-        perfc_port_resume_global_interrupt(wState);
-    }
-}
-
-/**
- * @brief Consume the command mailbox at an ISR or scheduler boundary.
- * @param ptThis FOC application object.
- * @return None.
- */
-static void foc_app_ConsumeCommand(foc_app_t *ptThis)
-{
-    foc_command_e eCommand = FOC_COMMAND_NONE;
-
-    if (ptThis == NULL) {
-        return;
-    }
-    eCommand = ptThis->tLifecycle.ePendingCommand;
-    if (eCommand == FOC_COMMAND_NONE) {
-        return;
-    }
-    ptThis->tLifecycle.ePendingCommand = FOC_COMMAND_NONE;
-    switch (eCommand) {
-    case FOC_COMMAND_START:
-        if (ptThis->tLifecycle.eState == FOC_STATE_IDLE) {
-            ptThis->tLifecycle.hwCalibrationTicks = 0U;
-            ptThis->tLifecycle.eState = FOC_STATE_CALIBRATING;
-        }
-        break;
-    case FOC_COMMAND_STOP:
-        ptThis->ptPwmOps->fnEmergencyStop(NULL);
-        ptThis->tLifecycle.bPwmEnabled = false;
-        ptThis->tLifecycle.eState = (ptThis->tLifecycle.wFaults == 0U)
-            ? FOC_STATE_IDLE : FOC_STATE_FAULT;
-        break;
-    case FOC_COMMAND_CLEAR_FAULT:
-        if ((ptThis->tLifecycle.eState == FOC_STATE_FAULT ||
-             ptThis->tLifecycle.eState == FOC_STATE_IDLE) &&
-            ptThis->tLifecycle.wFaults != 0U &&
-            !ptThis->tLifecycle.bPwmEnabled) {
-            ptThis->tLifecycle.wFaults = 0U;
-            ptThis->tLifecycle.eState = FOC_STATE_IDLE;
-        }
-        break;
-    case FOC_COMMAND_NONE:
-    default:
-        break;
-    }
-}
-
-/**
- * @brief Accumulate ADC offsets and enter RUNNING only after valid
- *        duty setup.
- * @param ptThis FOC application object.
- * @return None.
- */
-static void foc_app_CalibrationStep(foc_app_t *ptThis)
-{
-    foc_calibration_state_e eCalibration = FOC_CALIBRATION_BUSY;
-    foc_result_t eResult = FOC_RESULT_OK;
-
-    if (ptThis == NULL) {
-        return;
-    }
-    if (ptThis->tLifecycle.hwCalibrationTicks < UINT16_MAX) {
-        ptThis->tLifecycle.hwCalibrationTicks++;
-    }
-    eCalibration = ptThis->ptAdcOps->fnCalibrationStep(
-        NULL, &ptThis->tCalibration);
-    if (eCalibration == FOC_CALIBRATION_BUSY) {
-        if ((uint32_t)ptThis->tLifecycle.hwCalibrationTicks >=
-            FOC_APP_CALIBRATION_MAX_TICKS) {
-            foc_app_EnterFault(ptThis, FOC_FAULT_CALIBRATION_TIMEOUT);
-        }
-        return;
-    }
-    if (eCalibration != FOC_CALIBRATION_COMPLETE) {
-        foc_app_EnterFault(ptThis, FOC_FAULT_CALIBRATION);
-        return;
-    }
-    foc_core_Reset(&ptThis->tCore);
-    eResult = ptThis->ptPwmOps->fnDutyCommit(
-        NULL, &ptThis->tCore.tDuty);
-    if (eResult != FOC_RESULT_OK) {
-        foc_app_EnterFault(ptThis, FOC_FAULT_DUTY_COMMIT);
-        return;
-    }
-    eResult = ptThis->ptPwmOps->fnPwmEnable(NULL, true);
-    if (eResult != FOC_RESULT_OK) {
-        foc_app_EnterFault(ptThis, FOC_FAULT_PWM_ENABLE);
-        return;
-    }
-    ptThis->tLifecycle.bPwmEnabled = true;
-    ptThis->tLifecycle.eState = FOC_STATE_RUNNING;
-}
-
-/**
- * @brief Convert the selected position source into an electrical input.
- * @param ptThis FOC application object.
- * @param ptInput Core input to fill.
- * @return None.
- */
-static void foc_app_AngleStep(foc_app_t *ptThis,
-                              foc_core_input_t *ptInput)
-{
-    if (ptThis == NULL || ptInput == NULL) {
-        return;
-    }
-    if (ptThis->tPosition.eAngleSource == FOC_APP_ANGLE_OPEN_LOOP) {
-        ptThis->tPosition.tOpenLoopAngle = foc_angle_add_scalar(
-            ptThis->tPosition.tOpenLoopAngle,
-            foc_mul_pu(ptThis->tPosition.qOpenLoopSpeed,
-                       FOC_SCALAR(FOC_APP_HF_PERIOD_S)));
-        ptInput->tElectricalAngle = ptThis->tPosition.tOpenLoopAngle;
-        ptInput->qElectricalSpeed = ptThis->tPosition.qOpenLoopSpeed;
-        ptInput->bAngleValid = true;
-        ptThis->tDiagnostics.tElectricalAngle = ptInput->tElectricalAngle;
-        ptThis->tDiagnostics.qElectricalSpeed = ptInput->qElectricalSpeed;
-        return;
-    }
-    if (ptThis->tSensor.ptOps == NULL ||
-        ptThis->tSensor.ptOps->fnRead == NULL) {
-        ptInput->bAngleValid = false;
-        return;
-    }
-    {
-        foc_angle_t tMechanicalAngle = {0U};
-        foc_scalar_t qMechanicalSpeed = FOC_ZERO;
-        bool bValid = false;
-        uint64_t llElectrical = 0U;
-
-        if (ptThis->tSensor.ptOps->fnRead(
-                ptThis->tSensor.pPriv,
-                &tMechanicalAngle, &qMechanicalSpeed,
-                &bValid) != FOC_RESULT_OK || !bValid) {
-            ptInput->bAngleValid = false;
-            return;
-        }
-        ptThis->tPosition.qMechanicalSpeed = qMechanicalSpeed;
-        ptInput->bAngleValid = true;
-        llElectrical = (uint64_t)tMechanicalAngle.wBam32 *
-                       (uint64_t)ptThis->tPosition.chPolePairs;
-        ptThis->tDiagnostics.tElectricalAngle.wBam32 = (uint32_t)llElectrical;
-        if (ptThis->tPosition.bDirectionInverted) {
-            ptThis->tDiagnostics.tElectricalAngle.wBam32 = (uint32_t)(0U -
-                            ptThis->tDiagnostics.tElectricalAngle.wBam32);
-        }
-        ptThis->tDiagnostics.tElectricalAngle = foc_angle_add(
-            ptThis->tDiagnostics.tElectricalAngle,
-            ptThis->tPosition.tElectricalZero);
-        ptInput->tElectricalAngle = ptThis->tDiagnostics.tElectricalAngle;
-        ptInput->qElectricalSpeed = foc_mul_wide(
-            qMechanicalSpeed,
-            FOC_SCALAR((float)ptThis->tPosition.chPolePairs));
-        ptThis->tDiagnostics.qElectricalSpeed = ptInput->qElectricalSpeed;
-    }
 }
 
 /**
@@ -497,8 +363,8 @@ static void foc_app_CurrentStartupStep(foc_app_t *ptThis)
     if (ptThis == NULL) {
         return;
     }
-    ptCommand = ptThis->bMotorControlPath
-                    ? &ptThis->tMotor.tCommand : &ptThis->tCommand;
+    /* 对齐/斜坡只作用于 Motor 当前命令（产品路径恒为 Motor）。 */
+    ptCommand = &ptThis->tMotor.tCommand;
     if (ptThis->tPosition.bCurrentStartupAlign) {
         ptThis->tPosition.qOpenLoopSpeed = FOC_ZERO;
         ptCommand->eMode = FOC_MODE_VOLTAGE;
@@ -545,53 +411,6 @@ static void foc_app_CurrentStartupStep(foc_app_t *ptThis)
 }
 
 /**
- * @brief Execute one running current-control path.
- * @param ptThis FOC application object.
- * @param ptInput Core input workspace.
- * @return None.
- */
-static void foc_app_RunningStep(foc_app_t *ptThis,
-                                foc_core_input_t *ptInput)
-{
-    foc_result_t eResult = FOC_RESULT_OK;
-
-    if (ptThis == NULL || ptInput == NULL) {
-        return;
-    }
-    foc_app_CurrentStartupStep(ptThis);
-    eResult = ptThis->ptAdcOps->fnCurrentSample(
-        NULL, &ptThis->tCalibration, ptInput);
-    if (eResult != FOC_RESULT_OK) {
-        foc_app_EnterFault(ptThis, FOC_FAULT_CURRENT_SAMPLE);
-        return;
-    }
-    ptThis->tDiagnostics.qIu = ptInput->qIu;
-    ptThis->tDiagnostics.qIv = ptInput->qIv;
-    ptThis->tDiagnostics.qIw = ptInput->qIw;
-    foc_app_AngleStep(ptThis, ptInput);
-    if (!ptInput->bAngleValid) {
-        foc_app_EnterFault(ptThis, FOC_FAULT_ANGLE);
-        return;
-    }
-    eResult = foc_core_step(&ptThis->tCore, &ptThis->tCommand,
-                            ptInput);
-    if (eResult != FOC_RESULT_OK) {
-        foc_app_EnterFault(ptThis, FOC_FAULT_MATH);
-        return;
-    }
-    eResult = ptThis->ptPwmOps->fnDutyCommit(
-        NULL, &ptThis->tCore.tDuty);
-    if (eResult != FOC_RESULT_OK) {
-        foc_app_EnterFault(ptThis, FOC_FAULT_DUTY_COMMIT);
-        return;
-    }
-#if defined(FOC_NUMERIC_FLOAT)
-    ptThis->tDiagnostics.fElectricalAngleTurns =
-        foc_angle_to_turns(ptThis->tDiagnostics.tElectricalAngle);
-#endif
-}
-
-/**
  * @brief Execute the object-bound hard real-time FOC step.
  * @param ptThis FOC application object.
  * @return None.
@@ -599,7 +418,6 @@ static void foc_app_RunningStep(foc_app_t *ptThis,
  */
 void foc_app_HighFrequencyStep(foc_app_t *ptThis)
 {
-    foc_core_input_t tInput = {0};
 #if defined(MODUS_ENABLE) && MODUS_ENABLE
     int64_t lIsrCycles = 0;
     uint32_t wCycles = 0U;
@@ -610,26 +428,8 @@ void foc_app_HighFrequencyStep(foc_app_t *ptThis)
     if (ptThis == NULL) {
         return;
     }
-    if (ptThis->bMotorControlPath) {
-        motor_HighFrequencyStep(&ptThis->tMotor);
-        foc_app_SyncMotorView(ptThis);
-    } else {
-        foc_app_ConsumeCommand(ptThis);
-        switch (ptThis->tLifecycle.eState) {
-        case FOC_STATE_CALIBRATING:
-            foc_app_CalibrationStep(ptThis);
-            break;
-        case FOC_STATE_RUNNING:
-            foc_app_RunningStep(ptThis, &tInput);
-            break;
-        case FOC_STATE_IDLE:
-        case FOC_STATE_FAULT:
-            break;
-        default:
-            foc_app_EnterFault(ptThis, FOC_FAULT_STATE);
-            break;
-        }
-    }
+    motor_HighFrequencyStep(&ptThis->tMotor);
+    foc_app_SyncMotorView(ptThis);
 #if defined(FOC_NUMERIC_FLOAT) && defined(MWAVEFORM_ENABLE) && \
     MWAVEFORM_ENABLE
     mwaveform.Step();
@@ -661,6 +461,10 @@ static void foc_app_IsrTimingPrint(foc_app_t *ptThis, bool bReset)
     uint32_t wMaxCycles = 0U;
     uint32_t wSamples = 0U;
     uintptr_t wState = 0U;
+#if FOC_HF_DEADLINE_CYCLES > 0U
+    uint32_t wLoadPermille = 0U;
+    uint32_t wHeadroomCycles = 0U;
+#endif
 
     if (ptThis == NULL) {
         return;
@@ -673,11 +477,28 @@ static void foc_app_IsrTimingPrint(foc_app_t *ptThis, bool bReset)
         ptThis->tDiagnostics.wIsrSamples = 0U;
     }
     perfc_port_resume_global_interrupt(wState);
+#if FOC_HF_DEADLINE_CYCLES > 0U
+    wLoadPermille = (uint32_t)(
+        ((uint64_t)wMaxCycles * 1000U) /
+        (uint64_t)FOC_HF_DEADLINE_CYCLES);
+    wHeadroomCycles = wMaxCycles < FOC_HF_DEADLINE_CYCLES
+        ? FOC_HF_DEADLINE_CYCLES - wMaxCycles : 0U;
+    MLOGF(T, "[FOC] HF ISR: max=%lu us (%lu cyc) load=%lu.%lu%% "
+          "headroom=%lu cyc n=%lu\r\n",
+          (unsigned long)perfc_convert_ticks_to_us(
+              (int64_t)wMaxCycles),
+          (unsigned long)wMaxCycles,
+          (unsigned long)(wLoadPermille / 10U),
+          (unsigned long)(wLoadPermille % 10U),
+          (unsigned long)wHeadroomCycles,
+          (unsigned long)wSamples);
+#else
     MLOGF(T, "[FOC] HF ISR: max=%lu us (%lu cyc) n=%lu\r\n",
           (unsigned long)perfc_convert_ticks_to_us(
               (int64_t)wMaxCycles),
           (unsigned long)wMaxCycles,
           (unsigned long)wSamples);
+#endif
 }
 
 /**
@@ -701,202 +522,10 @@ static void foc_app_IsrTimingReport(foc_app_t *ptThis)
 
 #endif
 
-/**
- * @brief Run the 1 kHz speed controller for one App object.
- * @param ptThis FOC application object.
- * @return None.
- */
-static void foc_app_SpeedLoop(foc_app_t *ptThis)
-{
-    foc_scalar_t qSpeed = FOC_ZERO;
-    foc_scalar_t qReference = FOC_ZERO;
-    foc_scalar_t qIqReference = FOC_ZERO;
-    uintptr_t wState = 0U;
-
-    if (ptThis == NULL) {
-        return;
-    }
-    wState = perfc_port_disable_global_interrupt();
-    qSpeed = ptThis->tDiagnostics.qElectricalSpeed;
-    qReference = ptThis->tCommand.qSpeedReference;
-    perfc_port_resume_global_interrupt(wState);
-    qIqReference = foc_pid_Step(&ptThis->tSpeedPid,
-                                qReference, qSpeed);
-    wState = perfc_port_disable_global_interrupt();
-    ptThis->tCommand.tCurrentReference.qQ = qIqReference;
-    perfc_port_resume_global_interrupt(wState);
-}
-
 #if defined(MODUS_ENABLE) && MODUS_ENABLE
 
 /**
- * @brief Poll the cached position feedback with failure backoff.
- * @param ptThis FOC application object.
- * @return None.
- * @note I2C never runs in the SysTick Clock or hard ISR path.
- */
-static void foc_app_EncoderPoll(foc_app_t *ptThis)
-{
-    uint32_t wNow = 0U;
-    uint32_t wIntervalMs = 1U;
-    int32_t nResult = 0;
-
-    if (ptThis == NULL || !ptThis->tPosition.bEncoderEnabled ||
-        ptThis->tSensor.ptOps == NULL ||
-        ptThis->tSensor.ptOps->fnUpdate == NULL) {
-        return;
-    }
-    wNow = (uint32_t)get_system_ms();
-    if (ptThis->tDiagnostics.hwConsecutivePollFails > 0U) {
-        wIntervalMs = 100U;
-    }
-    if ((uint32_t)(wNow - ptThis->tDiagnostics.wLastPollMs) <
-        wIntervalMs) {
-        return;
-    }
-    ptThis->tDiagnostics.wLastPollMs = wNow;
-    nResult = ptThis->tSensor.ptOps->fnUpdate(ptThis->tSensor.pPriv);
-    if (nResult < 0) {
-        if (ptThis->tDiagnostics.hwConsecutivePollFails < UINT16_MAX) {
-            ptThis->tDiagnostics.hwConsecutivePollFails++;
-        }
-        return;
-    }
-    ptThis->tDiagnostics.hwConsecutivePollFails = 0U;
-    {
-        foc_angle_t tMechanicalAngle = {0U};
-        foc_scalar_t qMechanicalSpeed = FOC_ZERO;
-        bool bValid = false;
-
-        if (ptThis->tSensor.ptOps->fnRead != NULL &&
-            ptThis->tSensor.ptOps->fnRead(
-                ptThis->tSensor.pPriv,
-                &tMechanicalAngle, &qMechanicalSpeed,
-                &bValid) == FOC_RESULT_OK && bValid) {
-#if defined(FOC_NUMERIC_FLOAT)
-            ptThis->tDiagnostics.fEncoderMechanicalTurns =
-                foc_angle_to_turns(tMechanicalAngle);
-#endif
-        }
-    }
-}
-
-/**
- * @brief Capture a position zero after the asynchronous alignment interval.
- * @param ptThis FOC application object.
- * @return None.
- */
-static void foc_app_CaptureEncoderCalibration(foc_app_t *ptThis)
-{
-    foc_angle_t tMechanicalAngle = {0U};
-    foc_scalar_t qMechanicalSpeed = FOC_ZERO;
-    bool bValid = false;
-    float fMechanicalTurns = 0.0f;
-    float fElectricalOffset = 0.0f;
-
-    if (ptThis == NULL) {
-        return;
-    }
-    if (ptThis->tSensor.ptOps == NULL ||
-        ptThis->tSensor.ptOps->fnRead == NULL ||
-        ptThis->tSensor.ptOps->fnRead(
-            ptThis->tSensor.pPriv,
-            &tMechanicalAngle, &qMechanicalSpeed,
-            &bValid) != FOC_RESULT_OK || !bValid) {
-        foc_app_Stop(ptThis);
-        foc_app_EnterFault(ptThis, FOC_FAULT_ENCODER_CAL);
-        ptThis->tEncoderCalibration.eState = FOC_APP_ENCODER_CAL_IDLE;
-        return;
-    }
-    foc_app_Stop(ptThis);
-    fMechanicalTurns = foc_angle_to_turns(tMechanicalAngle);
-    fElectricalOffset = -fMechanicalTurns *
-                        (float)ptThis->tPosition.chPolePairs;
-    ptThis->tPosition.tElectricalZero =
-        foc_angle_from_turns(fElectricalOffset);
-    ptThis->tPosition.bEncoderCalibrated = true;
-    ptThis->tEncoderCalibration.eState = FOC_APP_ENCODER_CAL_IDLE;
-    MLOGF(I, "encoder cal: mech=%.4f turn offset=%.4f turn\r\n",
-          (double)fMechanicalTurns,
-          (double)foc_angle_to_turns(
-              ptThis->tPosition.tElectricalZero));
-}
-
-/**
- * @brief Advance the non-blocking encoder calibration workflow.
- * @param ptThis FOC application object.
- * @return None.
- */
-static void foc_app_EncoderCalibrationService(foc_app_t *ptThis)
-{
-    uint32_t wNow = 0U;
-    uintptr_t wState = 0U;
-    foc_core_command_t tCommand = {0};
-    foc_result_t eResult = FOC_RESULT_OK;
-
-    if (ptThis == NULL) {
-        return;
-    }
-    switch (ptThis->tEncoderCalibration.eState) {
-    case FOC_APP_ENCODER_CAL_IDLE:
-        break;
-    case FOC_APP_ENCODER_CAL_ALIGNING:
-        if (ptThis->tLifecycle.eState == FOC_STATE_IDLE) {
-            eResult = foc_app_ConfigureOpenLoop(
-                ptThis, (foc_angle_t){0U}, FOC_ZERO);
-            if (eResult != FOC_RESULT_OK) {
-                ptThis->tEncoderCalibration.eState = FOC_APP_ENCODER_CAL_IDLE;
-                return;
-            }
-            /* Id 定电流对齐（Iq=0，开环角固定 0）：电流环把转子吸到 D 轴，
-                力矩确定且可控，不受 R/L/母线电压散布影响。 */
-            tCommand.eMode = FOC_MODE_CURRENT;
-            tCommand.tCurrentReference.qD =
-                FOC_SCALAR(FOC_APP_ENC_CAL_ID_ALIGN);
-            tCommand.tCurrentReference.qQ = FOC_ZERO;
-            eResult = foc_app_Start(ptThis, &tCommand);
-            if (eResult != FOC_RESULT_OK) {
-                ptThis->tEncoderCalibration.eState = FOC_APP_ENCODER_CAL_IDLE;
-                return;
-            }
-            /* foc_app_Start 按当前标定态选 CURRENT 角度源：未标定→开环，
-               已标定→编码器。零位标定必须用「绝对开环角 0」的 Id 场把转子
-               吸到电角度 0：若已标定走编码器帧，Id 沿转子 D 轴施加、零对齐
-               力矩，转子自由漂移 → 每次抓拍位置随机 → offset 不可重复。
-               故 Start 后强制回到开环固定角 0（此刻仍 CALIBRATING，
-               512 拍 = 25.6 ms 后才进 RUNNING，无竞争）。 */
-            wState = perfc_port_disable_global_interrupt();
-            ptThis->tPosition.eAngleSource = FOC_APP_ANGLE_OPEN_LOOP;
-            ptThis->tPosition.tOpenLoopAngle = (foc_angle_t){0U};
-            ptThis->tPosition.qOpenLoopSpeed = FOC_ZERO;
-            ptThis->tPosition.qOpenLoopTargetSpeed = FOC_ZERO;
-            ptThis->tPosition.bCurrentStartupAlign = false;
-            perfc_port_resume_global_interrupt(wState);
-            ptThis->tEncoderCalibration.wStartedMs =
-                (uint32_t)get_system_ms();
-        } else if (ptThis->tLifecycle.eState == FOC_STATE_FAULT) {
-            ptThis->tEncoderCalibration.eState = FOC_APP_ENCODER_CAL_IDLE;
-        } else {
-            wNow = (uint32_t)get_system_ms();
-            if ((uint32_t)(wNow -
-                           ptThis->tEncoderCalibration.wStartedMs) >=
-                FOC_APP_ENCODER_CAL_MS) {
-                ptThis->tEncoderCalibration.eState =
-                    FOC_APP_ENCODER_CAL_CAPTURE;
-            }
-        }
-        break;
-    case FOC_APP_ENCODER_CAL_CAPTURE:
-        foc_app_CaptureEncoderCalibration(ptThis);
-        break;
-    default:
-        ptThis->tEncoderCalibration.eState = FOC_APP_ENCODER_CAL_IDLE;
-        break;
-    }
-}
-
-/**
- * @brief MODUS Clock callback for the object owning the speed loop.
+ * @brief MODUS Clock callback for the 1 kHz speed loop.
  * @param wObjectAddr Address of the owning App object.
  * @return MODUS_SUCCESS or an error code.
  */
@@ -907,15 +536,8 @@ static int foc_app_Clock(uintptr_t wObjectAddr)
     if (ptThis == NULL) {
         return MODUS_EFAIL;
     }
-    if (ptThis->bMotorControlPath) {
-        motor_ClockStep(&ptThis->tMotor);
-        foc_app_SyncMotorView(ptThis);
-        return MODUS_SUCCESS;
-    }
-    if (ptThis->tLifecycle.eState == FOC_STATE_RUNNING &&
-        ptThis->tCommand.eMode == FOC_MODE_SPEED) {
-        foc_app_SpeedLoop(ptThis);
-    }
+    motor_ClockStep(&ptThis->tMotor);
+    foc_app_SyncMotorView(ptThis);
     return MODUS_SUCCESS;
 }
 
@@ -933,14 +555,8 @@ static int foc_app_Run(uintptr_t wObjectAddr)
     }
     PERFC_PT_BEGIN(ptThis->tDiagnostics.chRunPt)
     while (1) {
-        if (ptThis->bMotorControlPath) {
-            motor_BackgroundStep(&ptThis->tMotor);
-            foc_app_SyncMotorView(ptThis);
-        } else {
-            foc_app_ConsumeCommand(ptThis);
-            foc_app_EncoderPoll(ptThis);
-            foc_app_EncoderCalibrationService(ptThis);
-        }
+        motor_BackgroundStep(&ptThis->tMotor);
+        foc_app_SyncMotorView(ptThis);
         foc_app_IsrTimingReport(ptThis);
         PERFC_PT_YIELD(MODUS_SUCCESS);
     }
@@ -972,19 +588,20 @@ typedef struct {
 static void foc_app_WaveformInit(foc_app_t *ptThis)
 {
     const foc_app_wave_channel_t atChannels[] = {
-        {"Iu", 1000.0f, (void *)&ptThis->tDiagnostics.qIu},
-        {"Iv", 1000.0f, (void *)&ptThis->tDiagnostics.qIv},
-        {"Iw", 1000.0f, (void *)&ptThis->tDiagnostics.qIw},
-        {"Id", 1000.0f, (void *)&ptThis->tCore.tCurrent.qD},
-        {"Iq", 1000.0f, (void *)&ptThis->tCore.tCurrent.qQ},
+        /* 波形直接采样 Motor 实时字段，不再经 App 镜像。 */
+        {"Iu", 1000.0f, (void *)&ptThis->tMotor.qIuLatest},
+        {"Iv", 1000.0f, (void *)&ptThis->tMotor.qIvLatest},
+        {"Iw", 1000.0f, (void *)&ptThis->tMotor.qIwLatest},
+        {"Id", 1000.0f, (void *)&ptThis->tMotor.tCore.tCurrent.qD},
+        {"Iq", 1000.0f, (void *)&ptThis->tMotor.tCore.tCurrent.qQ},
         {"Angle", 1000.0f,
          (void *)&ptThis->tDiagnostics.fElectricalAngleTurns},
         /* Speed scale 100：电速度可到 ±100 eHz，×100=10000 不超 int16；
            scale 1000 时 >32.8 eHz 即饱和卷绕（100→±32.7 假象）。 */
         {"Speed", 100.0f,
-         (void *)&ptThis->tDiagnostics.qElectricalSpeed},
-        {"Vd", 1000.0f, (void *)&ptThis->tCore.tVoltage.qD},
-        {"Vq", 1000.0f, (void *)&ptThis->tCore.tVoltage.qQ},
+         (void *)&ptThis->tMotor.tPositionFeedback.qElectricalSpeed},
+        {"Vd", 1000.0f, (void *)&ptThis->tMotor.tCore.tVoltage.qD},
+        {"Vq", 1000.0f, (void *)&ptThis->tMotor.tCore.tVoltage.qQ},
     };
     uint8_t chIndex = 0U;
     bool bOk = true;
@@ -1061,11 +678,10 @@ int foc_app_Init(uintptr_t wObjectAddr, uintptr_t wObjectCfgAddr)
         return FOC_RESULT_INVALID_ARGUMENT;
     }
     memset(ptThis, 0, sizeof(*ptThis));
-    ptThis->tLifecycle.eState = FOC_STATE_IDLE;
-    ptThis->tLifecycle.ePendingCommand = FOC_COMMAND_NONE;
     ptThis->tPosition.eAngleSource = FOC_APP_ANGLE_OPEN_LOOP;
     ptThis->tPosition.tElectricalZero = ptCfg->tElectricalZero;
     ptThis->tPosition.chPolePairs = ptCfg->tEncoderParams.chPolePairs;
+    ptThis->tPosition.bDirectionInverted = ptCfg->bDirectionInverted;
     ptThis->tSensor = ptCfg->tSensor;
     if (ptThis->tSensor.ptOps == NULL) {
         (void)foc_port_SensorInit(&ptCfg->tEncoderParams);
@@ -1073,8 +689,6 @@ int foc_app_Init(uintptr_t wObjectAddr, uintptr_t wObjectCfgAddr)
     }
     ptThis->tPosition.bEncoderEnabled =
         (ptThis->tSensor.ptOps != NULL);
-    ptThis->ptPwmOps = ptCfg->ptPwmOps;
-    ptThis->ptAdcOps = ptCfg->ptAdcOps;
     tMotorCfg.tMotorParams.chPolePairs =
         ptCfg->tEncoderParams.chPolePairs;
     tMotorCfg.tControlCfg.tCurrentPiParams = ptCfg->tCurrentPiParams;
@@ -1083,13 +697,15 @@ int foc_app_Init(uintptr_t wObjectAddr, uintptr_t wObjectCfgAddr)
         ptCfg->tEncoderParams.qHighFrequencyPeriod;
     tMotorCfg.tControlCfg.hwCalibrationTimeoutTicks =
         FOC_APP_CALIBRATION_MAX_TICKS;
-    tMotorCfg.ptPwmOps = ptThis->ptPwmOps;
-    tMotorCfg.ptAdcOps = ptThis->ptAdcOps;
+    tMotorCfg.tControlCfg.wPositionCalibrationTicks =
+        FOC_APP_ENCODER_CAL_TICKS;
+    tMotorCfg.ptPwmOps = ptCfg->ptPwmOps;
+    tMotorCfg.ptAdcOps = ptCfg->ptAdcOps;
     tMotorCfg.tPosition.ptOps = &s_tFocAppMotorPositionOps;
     tMotorCfg.tPosition.pContext = ptThis;
     eResult = motor_Init(&ptThis->tMotor, &tMotorCfg);
     if (eResult != FOC_RESULT_OK) {
-        ptThis->ptPwmOps->fnEmergencyStop(NULL);
+        ptCfg->ptPwmOps->fnEmergencyStop(NULL);
         return eResult;
     }
 
@@ -1099,26 +715,6 @@ int foc_app_Init(uintptr_t wObjectAddr, uintptr_t wObjectCfgAddr)
     s_tFocAppBaseCfg.pchRingBuffer = ptCfg->pchRingBuffer;
     s_tFocAppBaseCfg.hwRingSize = ptCfg->hwRingSize;
 #endif
-
-    eResult = foc_pid_Init(&ptThis->tCore.tIdPi,
-                           &ptCfg->tCurrentPiParams);
-    if (eResult != FOC_RESULT_OK) {
-        ptThis->ptPwmOps->fnEmergencyStop(NULL);
-        return eResult;
-    }
-    eResult = foc_pid_Init(&ptThis->tCore.tIqPi,
-                           &ptCfg->tCurrentPiParams);
-    if (eResult != FOC_RESULT_OK) {
-        ptThis->ptPwmOps->fnEmergencyStop(NULL);
-        return eResult;
-    }
-    foc_core_Reset(&ptThis->tCore);
-    eResult = foc_pid_Init(&ptThis->tSpeedPid,
-                           &ptCfg->tSpeedPiParams);
-    if (eResult != FOC_RESULT_OK) {
-        ptThis->ptPwmOps->fnEmergencyStop(NULL);
-        return eResult;
-    }
 
 #if defined(FOC_NUMERIC_FLOAT) && defined(MWAVEFORM_ENABLE) && \
     MWAVEFORM_ENABLE
@@ -1132,7 +728,7 @@ int foc_app_Init(uintptr_t wObjectAddr, uintptr_t wObjectCfgAddr)
     eResult = (foc_result_t)mbase_Init(ptThis->ptBase,
                                        &s_tFocAppBaseCfg);
     if (eResult != FOC_RESULT_OK) {
-        ptThis->ptPwmOps->fnEmergencyStop(NULL);
+        ptCfg->ptPwmOps->fnEmergencyStop(NULL);
         return eResult;
     }
 #endif
@@ -1148,8 +744,6 @@ int foc_app_Init(uintptr_t wObjectAddr, uintptr_t wObjectCfgAddr)
 foc_result_t foc_app_Start(foc_app_t *ptThis,
                            const foc_core_command_t *ptCommand)
 {
-    uintptr_t wState = 0U;
-
     if (ptThis == NULL || ptCommand == NULL) {
         return FOC_RESULT_NULL;
     }
@@ -1160,15 +754,7 @@ foc_result_t foc_app_Start(foc_app_t *ptThis,
         !foc_app_EncoderReady(ptThis)) {
         return FOC_RESULT_INVALID_ARGUMENT;
     }
-    wState = perfc_port_disable_global_interrupt();
-    if (ptThis->tLifecycle.eState != FOC_STATE_IDLE ||
-        ptThis->tLifecycle.wFaults != 0U) {
-        perfc_port_resume_global_interrupt(wState);
-        return FOC_RESULT_BUSY;
-    }
-    ptThis->tCommand = *ptCommand;
-    foc_core_Reset(&ptThis->tCore);
-    foc_pid_Reset(&ptThis->tSpeedPid);
+    /* 位置源选择只作用于 App 的 provider 上下文（开环/编码器）。 */
     ptThis->tPosition.bCurrentStartupAlign = false;
     ptThis->tPosition.wCurrentAlignTicks = 0U;
     if (ptCommand->eMode == FOC_MODE_CURRENT) {
@@ -1184,18 +770,10 @@ foc_result_t foc_app_Start(foc_app_t *ptThis,
     } else {
         /* Voltage mode keeps the configured open-loop position source. */
     }
-    perfc_port_resume_global_interrupt(wState);
-    if (ptCommand->eMode <= FOC_MODE_SPEED) {
-        ptThis->bMotorControlPath = true;
-        if (motor_Start(&ptThis->tMotor, ptCommand) != FOC_RESULT_OK) {
-            ptThis->bMotorControlPath = false;
-            return FOC_RESULT_BUSY;
-        }
-        foc_app_SyncMotorView(ptThis);
-        return FOC_RESULT_OK;
+    if (motor_Start(&ptThis->tMotor, ptCommand) != FOC_RESULT_OK) {
+        return FOC_RESULT_BUSY;
     }
-    ptThis->ptAdcOps->fnCalibrationBegin(NULL, &ptThis->tCalibration);
-    foc_app_PostCommand(ptThis, FOC_COMMAND_START);
+    foc_app_SyncMotorView(ptThis);
     return FOC_RESULT_OK;
 }
 
@@ -1207,13 +785,8 @@ foc_result_t foc_app_Start(foc_app_t *ptThis,
 void foc_app_Stop(foc_app_t *ptThis)
 {
     if (ptThis != NULL) {
-        if (ptThis->bMotorControlPath) {
-            motor_Stop(&ptThis->tMotor);
-            foc_app_SyncMotorView(ptThis);
-            return;
-        }
-        ptThis->ptPwmOps->fnEmergencyStop(NULL);
-        foc_app_PostCommand(ptThis, FOC_COMMAND_STOP);
+        motor_Stop(&ptThis->tMotor);
+        foc_app_SyncMotorView(ptThis);
     }
 }
 
@@ -1224,28 +797,16 @@ void foc_app_Stop(foc_app_t *ptThis)
  */
 foc_result_t foc_app_ClearFault(foc_app_t *ptThis)
 {
-    uintptr_t wState = 0U;
-    bool bCanClear = false;
+    foc_result_t eResult = FOC_RESULT_BUSY;
 
     if (ptThis == NULL) {
         return FOC_RESULT_NULL;
     }
-    if (ptThis->bMotorControlPath) {
-        if (motor_ClearFault(&ptThis->tMotor) != FOC_RESULT_OK) {
-            return FOC_RESULT_BUSY;
-        }
+    eResult = motor_ClearFault(&ptThis->tMotor);
+    if (eResult == FOC_RESULT_OK) {
         foc_app_SyncMotorView(ptThis);
-        return FOC_RESULT_OK;
     }
-    wState = perfc_port_disable_global_interrupt();
-    bCanClear = ptThis->tLifecycle.wFaults != 0U &&
-                !ptThis->tLifecycle.bPwmEnabled;
-    perfc_port_resume_global_interrupt(wState);
-    if (!bCanClear) {
-        return FOC_RESULT_BUSY;
-    }
-    foc_app_PostCommand(ptThis, FOC_COMMAND_CLEAR_FAULT);
-    return FOC_RESULT_OK;
+    return eResult;
 }
 
 /**
@@ -1259,26 +820,14 @@ foc_result_t foc_app_SetVoltageReference(foc_app_t *ptThis,
                                          foc_scalar_t qD,
                                          foc_scalar_t qQ)
 {
-    uintptr_t wState = 0U;
     foc_result_t eResult = FOC_RESULT_OK;
 
     if (ptThis == NULL) {
         return FOC_RESULT_NULL;
     }
-    if (ptThis->bMotorControlPath) {
-        eResult = motor_SetVoltageReference(&ptThis->tMotor, qD, qQ);
-        foc_app_SyncMotorView(ptThis);
-        return eResult;
-    }
-    wState = perfc_port_disable_global_interrupt();
-    if (ptThis->tCommand.eMode != FOC_MODE_VOLTAGE) {
-        perfc_port_resume_global_interrupt(wState);
-        return FOC_RESULT_INVALID_ARGUMENT;
-    }
-    ptThis->tCommand.tVoltageReference.qD = qD;
-    ptThis->tCommand.tVoltageReference.qQ = qQ;
-    perfc_port_resume_global_interrupt(wState);
-    return FOC_RESULT_OK;
+    eResult = motor_SetVoltageReference(&ptThis->tMotor, qD, qQ);
+    foc_app_SyncMotorView(ptThis);
+    return eResult;
 }
 
 /**
@@ -1292,26 +841,14 @@ foc_result_t foc_app_SetCurrentReference(foc_app_t *ptThis,
                                          foc_scalar_t qD,
                                          foc_scalar_t qQ)
 {
-    uintptr_t wState = 0U;
     foc_result_t eResult = FOC_RESULT_OK;
 
     if (ptThis == NULL) {
         return FOC_RESULT_NULL;
     }
-    if (ptThis->bMotorControlPath) {
-        eResult = motor_SetCurrentReference(&ptThis->tMotor, qD, qQ);
-        foc_app_SyncMotorView(ptThis);
-        return eResult;
-    }
-    wState = perfc_port_disable_global_interrupt();
-    if (ptThis->tCommand.eMode != FOC_MODE_CURRENT) {
-        perfc_port_resume_global_interrupt(wState);
-        return FOC_RESULT_INVALID_ARGUMENT;
-    }
-    ptThis->tCommand.tCurrentReference.qD = qD;
-    ptThis->tCommand.tCurrentReference.qQ = qQ;
-    perfc_port_resume_global_interrupt(wState);
-    return FOC_RESULT_OK;
+    eResult = motor_SetCurrentReference(&ptThis->tMotor, qD, qQ);
+    foc_app_SyncMotorView(ptThis);
+    return eResult;
 }
 
 /**
@@ -1323,26 +860,15 @@ foc_result_t foc_app_SetCurrentReference(foc_app_t *ptThis,
 foc_result_t foc_app_SetSpeedReference(
     foc_app_t *ptThis, foc_scalar_t qElectricalTurnPerSecond)
 {
-    uintptr_t wState = 0U;
     foc_result_t eResult = FOC_RESULT_OK;
 
     if (ptThis == NULL) {
         return FOC_RESULT_NULL;
     }
-    if (ptThis->bMotorControlPath) {
-        eResult = motor_SetSpeedReference(
-            &ptThis->tMotor, qElectricalTurnPerSecond);
-        foc_app_SyncMotorView(ptThis);
-        return eResult;
-    }
-    wState = perfc_port_disable_global_interrupt();
-    if (ptThis->tCommand.eMode != FOC_MODE_SPEED) {
-        perfc_port_resume_global_interrupt(wState);
-        return FOC_RESULT_INVALID_ARGUMENT;
-    }
-    ptThis->tCommand.qSpeedReference = qElectricalTurnPerSecond;
-    perfc_port_resume_global_interrupt(wState);
-    return FOC_RESULT_OK;
+    eResult = motor_SetSpeedReference(
+        &ptThis->tMotor, qElectricalTurnPerSecond);
+    foc_app_SyncMotorView(ptThis);
+    return eResult;
 }
 
 /**
@@ -1357,17 +883,22 @@ foc_result_t foc_app_ConfigureOpenLoop(
     foc_angle_t tInitialAngle,
     foc_scalar_t qElectricalSpeed)
 {
+    motor_status_t tStatus = {0};
     uintptr_t wState = 0U;
 
     if (ptThis == NULL) {
         return FOC_RESULT_NULL;
     }
-    wState = perfc_port_disable_global_interrupt();
-    if (ptThis->tLifecycle.eState != FOC_STATE_IDLE ||
-        ptThis->tLifecycle.wFaults != 0U) {
-        perfc_port_resume_global_interrupt(wState);
+    if (motor_GetStatus(&ptThis->tMotor, &tStatus) != FOC_RESULT_OK) {
         return FOC_RESULT_BUSY;
     }
+    if (tStatus.eLifecycle == MOTOR_STATE_RUNNING ||
+        tStatus.eLifecycle == MOTOR_STATE_POSITION_CAL ||
+        tStatus.eLifecycle == MOTOR_STATE_FAULT ||
+        tStatus.wFaults != 0U) {
+        return FOC_RESULT_BUSY;
+    }
+    wState = perfc_port_disable_global_interrupt();
     ptThis->tPosition.eAngleSource = FOC_APP_ANGLE_OPEN_LOOP;
     ptThis->tPosition.tOpenLoopAngle = tInitialAngle;
     ptThis->tPosition.qOpenLoopSpeed = qElectricalSpeed;
@@ -1377,29 +908,30 @@ foc_result_t foc_app_ConfigureOpenLoop(
 }
 
 /**
- * @brief Submit an asynchronous encoder zero calibration request.
+ * @brief Submit an encoder zero calibration request through Motor.
  * @param ptThis FOC application object.
  * @return FOC_RESULT_OK or an error code.
+ * @note Motor owns the align/capture state machine and drives the safe
+ *       align current; this wrapper only keeps the encoder availability
+ *       gate and mirrors the Motor lifecycle back into the App view.
  */
 foc_result_t foc_app_RequestEncoderCalibration(foc_app_t *ptThis)
 {
-    uintptr_t wState = 0U;
+    foc_result_t eResult = FOC_RESULT_BUSY;
 
     if (ptThis == NULL) {
         return FOC_RESULT_NULL;
     }
-    wState = perfc_port_disable_global_interrupt();
     if (ptThis->tSensor.ptOps == NULL ||
-        !ptThis->tPosition.bEncoderEnabled ||
-        ptThis->tLifecycle.eState != FOC_STATE_IDLE ||
-        ptThis->tLifecycle.wFaults != 0U ||
-        ptThis->tEncoderCalibration.eState != FOC_APP_ENCODER_CAL_IDLE) {
-        perfc_port_resume_global_interrupt(wState);
+        !ptThis->tPosition.bEncoderEnabled) {
         return FOC_RESULT_BUSY;
     }
-    ptThis->tEncoderCalibration.eState = FOC_APP_ENCODER_CAL_ALIGNING;
-    perfc_port_resume_global_interrupt(wState);
-    return FOC_RESULT_OK;
+    eResult = motor_RequestPositionCalibration(
+        &ptThis->tMotor, FOC_SCALAR(FOC_APP_ENC_CAL_ID_ALIGN));
+    if (eResult == FOC_RESULT_OK) {
+        foc_app_SyncMotorView(ptThis);
+    }
+    return eResult;
 }
 
 /**
@@ -1431,7 +963,30 @@ foc_result_t foc_app_GetFeedback(const foc_app_t *ptThis,
 }
 
 /**
- * @brief Copy a consistent status snapshot from an App object.
+ * @brief Map a Motor lifecycle onto the App query-state enum.
+ * @param eLifecycle Motor lifecycle.
+ * @return Matching foc_run_state_e value.
+ */
+static foc_run_state_e foc_app_MapState(motor_lifecycle_e eLifecycle)
+{
+    switch (eLifecycle) {
+    case MOTOR_STATE_CALIBRATING:
+        return FOC_STATE_CALIBRATING;
+    case MOTOR_STATE_POSITION_CAL:
+        return FOC_STATE_CALIBRATING;
+    case MOTOR_STATE_RUNNING:
+        return FOC_STATE_RUNNING;
+    case MOTOR_STATE_FAULT:
+        return FOC_STATE_FAULT;
+    case MOTOR_STATE_IDLE:
+    case MOTOR_STATE_INITIALIZING:
+    default:
+        return FOC_STATE_IDLE;
+    }
+}
+
+/**
+ * @brief Assemble a status snapshot directly from the Motor object.
  * @param ptThis FOC application object.
  * @param ptStatus Output status snapshot.
  * @return FOC_RESULT_OK or an error code.
@@ -1439,26 +994,30 @@ foc_result_t foc_app_GetFeedback(const foc_app_t *ptThis,
 foc_result_t foc_app_GetStatus(const foc_app_t *ptThis,
                                foc_status_t *ptStatus)
 {
+    motor_feedback_t tFeedback = {0};
+    motor_status_t tStatus = {0};
     uintptr_t wState = 0U;
 
     if (ptThis == NULL || ptStatus == NULL) {
         return FOC_RESULT_NULL;
     }
     wState = perfc_port_disable_global_interrupt();
-    ptStatus->eState = ptThis->tLifecycle.eState;
-    ptStatus->wFaults = ptThis->tLifecycle.wFaults;
-    ptStatus->tElectricalAngle = ptThis->tDiagnostics.tElectricalAngle;
+    (void)motor_GetFeedback(&ptThis->tMotor, &tFeedback);
+    (void)motor_GetStatus(&ptThis->tMotor, &tStatus);
+    ptStatus->eState = foc_app_MapState(tStatus.eLifecycle);
+    ptStatus->wFaults = tStatus.wFaults;
+    ptStatus->tElectricalAngle = tFeedback.tPosition.tElectricalAngle;
     ptStatus->tElectricalZero = ptThis->tPosition.tElectricalZero;
-    ptStatus->qElectricalSpeed = ptThis->tDiagnostics.qElectricalSpeed;
-    ptStatus->tCurrent = ptThis->tCore.tCurrent;
-    ptStatus->tVoltage = ptThis->tCore.tVoltage;
-    ptStatus->tDuty = ptThis->tCore.tDuty;
-    ptStatus->tCalibration = ptThis->tCalibration;
-    ptStatus->eMode = ptThis->tCommand.eMode;
-    ptStatus->tVoltageReference = ptThis->tCommand.tVoltageReference;
-    ptStatus->tCurrentReference = ptThis->tCommand.tCurrentReference;
-    ptStatus->qSpeedReference = ptThis->tCommand.qSpeedReference;
-    ptStatus->bPwmEnabled = ptThis->tLifecycle.bPwmEnabled;
+    ptStatus->qElectricalSpeed = tFeedback.tPosition.qElectricalSpeed;
+    ptStatus->tCurrent = tFeedback.tCurrent;
+    ptStatus->tVoltage = tFeedback.tVoltage;
+    ptStatus->tDuty = tFeedback.tDuty;
+    ptStatus->tCalibration = ptThis->tMotor.tAdcCalibration;
+    ptStatus->eMode = tStatus.tCommand.eMode;
+    ptStatus->tVoltageReference = tStatus.tCommand.tVoltageReference;
+    ptStatus->tCurrentReference = tStatus.tCommand.tCurrentReference;
+    ptStatus->qSpeedReference = tStatus.tCommand.qSpeedReference;
+    ptStatus->bPwmEnabled = tStatus.bPwmEnabled;
     ptStatus->bEncoderCalibrated = ptThis->tPosition.bEncoderCalibrated;
     perfc_port_resume_global_interrupt(wState);
     return FOC_RESULT_OK;
@@ -1484,14 +1043,17 @@ void foc_app_TestMarkEncoderCalibrated(foc_app_t *ptThis)
  */
 void foc_app_TestRun1kHz(foc_app_t *ptThis)
 {
-    if (ptThis != NULL && ptThis->tLifecycle.eState == FOC_STATE_RUNNING &&
-        ptThis->tCommand.eMode == FOC_MODE_SPEED) {
-        if (ptThis->bMotorControlPath) {
-            motor_ClockStep(&ptThis->tMotor);
-            foc_app_SyncMotorView(ptThis);
-        } else {
-            foc_app_SpeedLoop(ptThis);
-        }
+    motor_status_t tStatus = {0};
+
+    if (ptThis == NULL) {
+        return;
+    }
+    if (motor_GetStatus(&ptThis->tMotor, &tStatus) != FOC_RESULT_OK) {
+        return;
+    }
+    if (tStatus.eLifecycle == MOTOR_STATE_RUNNING &&
+        tStatus.tCommand.eMode == FOC_MODE_SPEED) {
+        motor_ClockStep(&ptThis->tMotor);
     }
 }
 
@@ -1506,7 +1068,7 @@ foc_scalar_t foc_app_TestGetCurrentIqReference(
     if (ptThis == NULL) {
         return FOC_ZERO;
     }
-    return ptThis->tCommand.tCurrentReference.qQ;
+    return ptThis->tMotor.tCommand.tCurrentReference.qQ;
 }
 #endif
 
@@ -1884,7 +1446,8 @@ static void cmd_encoder(const char *args)
         if (eResult == FOC_RESULT_OK) {
             MLOG(I, "Encoder cal requested; keep shaft untouched\r\n");
         } else {
-            MLOG(W, "encoder cal request rejected\r\n");
+            MLOGF(W, "encoder cal request rejected (%d)\r\n",
+                  (int)eResult);
         }
         return;
     }

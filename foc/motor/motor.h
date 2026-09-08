@@ -21,6 +21,7 @@ typedef struct {
     foc_pid_params_t tSpeedPiParams;
     foc_scalar_t qHighFrequencyPeriod;
     uint16_t hwCalibrationTimeoutTicks;
+    uint32_t wPositionCalibrationTicks;
 } motor_control_cfg_t;
 
 typedef struct {
@@ -37,6 +38,7 @@ typedef enum {
     MOTOR_STATE_INITIALIZING = 0,
     MOTOR_STATE_IDLE,
     MOTOR_STATE_CALIBRATING,
+    MOTOR_STATE_POSITION_CAL,
     MOTOR_STATE_RUNNING,
     MOTOR_STATE_FAULT,
 } motor_lifecycle_e;
@@ -47,6 +49,7 @@ typedef enum {
     MOTOR_COMMAND_STOP,
     MOTOR_COMMAND_CLEAR_FAULT,
     MOTOR_COMMAND_ADC_CALIBRATION,
+    MOTOR_COMMAND_POSITION_CALIBRATION,
 } motor_command_e;
 
 typedef enum {
@@ -59,6 +62,7 @@ typedef enum {
     MOTOR_FAULT_DUTY_COMMIT = (1UL << 5),
     MOTOR_FAULT_PWM_ENABLE = (1UL << 6),
     MOTOR_FAULT_STATE = (1UL << 7),
+    MOTOR_FAULT_POSITION_CAL = (1UL << 8),
 } motor_fault_e;
 
 typedef struct {
@@ -74,17 +78,24 @@ typedef struct {
     motor_position_t tPosition;
     foc_scalar_t qHighFrequencyPeriod;
     uint16_t hwCalibrationTimeoutTicks;
+    uint32_t wPositionCalibrationTicks;
     foc_core_state_t tCore;
     foc_pid_t tSpeedPi;
     foc_adc_calib_t tAdcCalibration;
     motor_command_sync_t tCommandSync;
     foc_core_command_t tCommand;
+    foc_scalar_t qSpeedIqLimit;
     motor_lifecycle_e eLifecycle;
     motor_position_feedback_t tPositionFeedback;
+    foc_scalar_t qIuLatest;     /**< 最近一拍 U 相电流（波形镜像缓存） */
+    foc_scalar_t qIvLatest;     /**< 最近一拍 V 相电流（波形镜像缓存） */
+    foc_scalar_t qIwLatest;     /**< 最近一拍 W 相电流（波形镜像缓存） */
     uint32_t wFaults;
     uint16_t hwCalibrationTicks;
+    uint32_t wPositionCalibrationCount;
     bool bPwmEnabled;
     bool bStartAfterCalibration;
+    bool bPositionCalAfterCalibration;
 } motor_t;
 
 typedef struct {
@@ -123,5 +134,17 @@ foc_result_t motor_GetFeedback(const motor_t *ptMotor,
 foc_result_t motor_GetStatus(const motor_t *ptMotor,
                              motor_status_t *ptStatus);
 foc_result_t motor_CaptureElectricalZero(motor_t *ptMotor);
+
+/**
+ * @brief Align the rotor with the fixed zero angle and capture the
+ *        electrical zero through the active position provider.
+ * @param ptMotor       Motor object.
+ * @param qAlignCurrent D-axis align current reference (0 < q <= 1 pu).
+ * @return FOC_RESULT_OK when the request was accepted. A provider without
+ *         fnCaptureElectricalZero returns FOC_RESULT_DISABLED; an invalid
+ *         state or argument returns FOC_RESULT_BUSY or INVALID_ARGUMENT.
+ */
+foc_result_t motor_RequestPositionCalibration(motor_t *ptMotor,
+                                              foc_scalar_t qAlignCurrent);
 
 #endif /* MOTOR_H */
