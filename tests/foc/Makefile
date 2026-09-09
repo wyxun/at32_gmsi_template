@@ -22,6 +22,7 @@ CFLAGS += $(STRICT_ALIAS_CFLAGS) $(EXTRA_CFLAGS)
         minimal-encoder minimal-encoder-float minimal-encoder-fixed \
         minimal-lifecycle minimal-lifecycle-float minimal-lifecycle-fixed \
         motor-float motor-fixed as5600-float as5600-fixed \
+        framework-contract framework-contract-float framework-contract-fixed \
         clean
 
 MINIMAL_CORE_SRCS = test_foc_minimal_core.c \
@@ -110,6 +111,30 @@ motor-fixed:
 	    -lm -o motor_fixed
 	./motor_fixed
 
+FRAMEWORK_CONTRACT_SRCS = test_framework_contract.c \
+                          ../../foc/math/foc_numeric.c \
+                          ../../foc/math/foc_angle.c \
+                          ../../foc/math/foc_trig_lut.c \
+                          ../../foc/math/foc_math.c \
+                          ../../foc/middleware/foc_core.c \
+                          ../../foc/control/foc_pid.c \
+                          ../../foc/modulation/foc_modulation.c \
+                          ../../foc/motor/motor.c
+
+framework-contract: framework-contract-float framework-contract-fixed
+
+framework-contract-float:
+	$(CC) $(CFLAGS) -DPERFC_TEST_CRITICAL_HOOKS=1 \
+	    -DFOC_NUMERIC_FLOAT=1 $(FRAMEWORK_CONTRACT_SRCS) \
+	    -lm -o framework_contract_float
+	./framework_contract_float
+
+framework-contract-fixed:
+	$(CC) $(CFLAGS) -DPERFC_TEST_CRITICAL_HOOKS=1 \
+	    -DFOC_NUMERIC_FIXED=1 $(FRAMEWORK_CONTRACT_SRCS) \
+	    -lm -o framework_contract_fixed
+	./framework_contract_fixed
+
 AS5600_SRCS = test_as5600.c \
               ../../foc/math/foc_numeric.c \
               ../../foc/math/foc_angle.c \
@@ -129,7 +154,8 @@ as5600-fixed:
 	./as5600_fixed
 
 minimal: minimal-core minimal-encoder minimal-lifecycle \
-         motor-float motor-fixed as5600-float as5600-fixed
+         motor-float motor-fixed as5600-float as5600-fixed \
+         framework-contract
 
 all: minimal
 
@@ -137,4 +163,5 @@ clean:
 	$(RM) minimal_core_float minimal_core_fixed \
 	      minimal_encoder_float minimal_encoder_fixed \
 	      minimal_lifecycle_float minimal_lifecycle_fixed \
-      motor_float motor_fixed as5600_float as5600_fixed
+      motor_float motor_fixed as5600_float as5600_fixed \
+      framework_contract_float framework_contract_fixed

@@ -12,8 +12,8 @@
  * 函数指针间接层，-flto 下内联为直接调用，成本趋零；多芯片/多传感
  * 器适配只更换 ops 表，foc 内部零改动。
  *
- * 位置/速度传感器统一抽象为 foc_sensor_t（foc_sensor.h），本文件只
- * 暴露板级默认实例 g_tFocSensor 与初始化入口 foc_port_SensorInit。
+ * 位置/速度反馈由 motor_position.h 单独抽象；本文件只暴露板级默认
+ * PositionPort 绑定配置。
  **************************************************************************/
 
 #ifndef FOC_PORT_H
@@ -23,8 +23,23 @@
 #include <stdint.h>
 
 #include "foc_types.h"
-#include "foc_sensor.h"
 #include "foc_encoder.h"
+#include "motor_position.h"
+
+#if defined(__has_include)
+#if __has_include("foc_port_config.h")
+#include "foc_port_config.h"
+#endif
+#endif
+
+#ifndef FOC_PORT_HAS_POSITION
+#define FOC_PORT_HAS_POSITION 1
+#endif
+
+#ifndef FOC_PORT_DEFAULT_POSITION
+#define FOC_PORT_DEFAULT_POSITION \
+    { .ptOps = NULL, .pContext = NULL }
+#endif
 
 typedef enum {
     FOC_CALIBRATION_BUSY = 0,
@@ -59,12 +74,8 @@ typedef struct {
         foc_core_input_t *ptInput);
 } foc_adc_ops_t;
 
-/* ===== 默认实例（由各芯片 foc_port.c 提供；host 测试可注入 stub） ===== */
+/* ===== 默认 ADC/PWM 实例（由各芯片 foc_port.c 提供） ===== */
 extern const foc_pwm_ops_t  g_tFocPwmOps;
 extern const foc_adc_ops_t  g_tFocAdcOps;
-extern const foc_sensor_t   g_tFocSensor;
-
-/** @brief Initialize the board-level position sensor. */
-int32_t foc_port_SensorInit(const foc_encoder_params_t *ptParams);
 
 #endif /* FOC_PORT_H */

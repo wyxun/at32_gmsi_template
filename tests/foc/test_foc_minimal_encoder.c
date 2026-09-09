@@ -12,10 +12,9 @@ static foc_encoder_t encoder_ready(foc_encoder_params_t *ptParams)
     foc_encoder_t tEncoder = {0};
 
     foc_encoder_DefaultParams(ptParams);
-    ptParams->chPolePairs = TEST_POLE_PAIRS;
-    ptParams->qHighFrequencyPeriod = FOC_SCALAR(TEST_PERIOD_S);
     ptParams->hwInvalidTimeout = TEST_TIMEOUT;
-    (void)foc_encoder_Init(&tEncoder, ptParams);
+    (void)foc_encoder_Init(&tEncoder, ptParams, TEST_POLE_PAIRS,
+                           FOC_SCALAR(TEST_PERIOD_S));
     return tEncoder;
 }
 
@@ -41,15 +40,14 @@ static int test_invalid_init_params(void)
     foc_encoder_t tEncoder = {0};
 
     foc_encoder_DefaultParams(&tParams);
-    tParams.chPolePairs = 0U;
-    if (foc_encoder_Init(&tEncoder, &tParams) !=
+    if (foc_encoder_Init(&tEncoder, &tParams, 0U,
+                         FOC_SCALAR(TEST_PERIOD_S)) !=
         FOC_RESULT_INVALID_ARGUMENT) {
         return 1;
     }
     foc_encoder_DefaultParams(&tParams);
-    tParams.chPolePairs = TEST_POLE_PAIRS;
-    tParams.qHighFrequencyPeriod = FOC_ZERO;
-    return foc_encoder_Init(&tEncoder, &tParams) !=
+    return foc_encoder_Init(&tEncoder, &tParams, TEST_POLE_PAIRS,
+                            FOC_ZERO) !=
            FOC_RESULT_INVALID_ARGUMENT;
 }
 

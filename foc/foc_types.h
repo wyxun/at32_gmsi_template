@@ -53,6 +53,8 @@ typedef enum {
     FOC_MODE_VOLTAGE = 0,
     FOC_MODE_CURRENT,
     FOC_MODE_SPEED,
+    FOC_MODE_POSITION,
+    FOC_MODE_MAX,
 } foc_control_mode_e;
 
 typedef struct {

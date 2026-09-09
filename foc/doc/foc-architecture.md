@@ -10,10 +10,14 @@
 │  产品应用 / 中断 / Shell                          │
 │  (target/stm32g4xx_it.c → foc_app_HighFrequencyISR) │
 ├──────────────────────────────────────────────────┤
-│  foc_app.c   MODUS Class：foc_app_t tFocApp       │
-│    ├── ptPwmOps / ptAdcOps / ptPositionOps 注入    │
-│    ├── foc_encoder_Step（外推）                    │
-│    └── foc_core_step（纯数学闭环）                 │
+│  foc_app.c   MODUS glue：foc_app_t tFocApp        │
+│    ├── owns one motor_t                           │
+│    └── Shell / waveform / scheduling              │
+├──────────────────────────────────────────────────┤
+│  motor.c    lifecycle + control orchestration     │
+│    ├── ADC_CAL / ALIGN / RUNNING / FAULT          │
+│    ├── cached PositionPort + foreground Poll      │
+│    └── 20 kHz current loop + 20:1 speed loop      │
 ├──────────────────────────────────────────────────┤
 │  middleware/foc_core.c   Clarke/Park/PI/IPark/SVPWM │
 │  observer/foc_encoder.c  角度/速度观测 + 外推      │
@@ -30,9 +34,9 @@
 
 职责划分原则：
 
-- **硬件只在 `foc_port.c` 访问**：采样、校准、PWM 提交、使能、急停全部
-  收敛为 `foc_port.h` 定义的 ops 表（`foc_pwm_ops_t`/`foc_adc_ops_t`/
-  `foc_position_ops_t`）。foc 内部（app/算法）只通过注入的 ops 指针
+- **硬件只在 port/driver 访问**：采样、校准、PWM 提交、使能、急停全部
+  收敛为 `foc_port.h` 与 `motor_position.h` 定义的 ops 表
+  （`foc_pwm_ops_t`/`foc_adc_ops_t`/`motor_position_ops_t`）。foc 内部只通过注入的 ops 指针
   访问硬件，不直接接触 MDI/vendor。
 - **ops 注入 + -flto 内联**：20 kHz 高频路径经过 ops 函数指针间接层，
   -flto 下内联为直接调用，成本趋零（详见 §10 设计决策）。多芯片/多
@@ -45,9 +49,8 @@
 
 ### 极简伞头
 
-`foc/foc.h` 只导出 `foc_types.h`、`foc_core.h`、`foc_pid.h`、
-`foc_modulation.h`、`foc_encoder.h`、`foc_app.h`。旧的多实例框架
-（`motor/`、`foc_hal*.c/h`、位置源接口表）已删除，不再构建。
+`foc/foc.h` 只导出公共算法与 App 入口。Motor 通过
+`motor.h`/`motor_position.h` 提供单实例域对象，旧的 `foc_hal` 适配器不再构建。
 
 ## 2. 数值后端：浮点 / 定点双轨设计
 
@@ -100,29 +103,32 @@ typedef struct {
 - `foc_angle_sincos()` 一次计算，`foc_park_cached()` / `foc_ipark_cached()`
   复用，避免重复三角调用。
 
-## 5. 四态生命周期与命令邮箱
+## 5. 生命周期与请求边界
 
 ### 5.1 状态机
 
 ```text
-IDLE ──START──▶ CALIBRATING ──校准完成──▶ RUNNING
-  ▲                 │ 超时/偏移非法          │ 运行错误
-  │                 ▼                        ▼
-  └────clear◀──── FAULT ◀───────第一动作急停────┘
+INITIALIZING ──▶ ADC_CAL ──▶ IDLE ──▶ ALIGN ──▶ IDLE
+       │             │          │        │
+       └─────────────┴──────────┴────────┴──▶ FAULT
+                                  IDLE ──▶ RUNNING
 ```
 
 | 状态 | PWM | 说明 |
 |---|---|---|
-| IDLE | 关 | 接受 START；`foc_port_EmergencyStop()` 在 Init 即调用 |
-| CALIBRATING | 关 | `foc_port_CurrentCalibrationStep()` 累计 512 拍零偏；超时（2000 拍）/失败 → FAULT |
+| INITIALIZING | 关 | 初始化注册的 ADC、PWM、PositionPort |
+| ADC_CAL | 关 | ops 累计零偏；超时/失败 → FAULT |
+| IDLE | 关 | 接受 start、recalibration 和 alignment 请求 |
+| ALIGN | 开 | 固定 D 轴电流，完成后捕获 PositionPort 零位并急停 |
 | RUNNING | 开 | 高频链路；进入前 PI 复位、中性 duty 先写再使能 PWM |
 | FAULT | 关（急停） | 任何运行错误第一动作 `foc_port_EmergencyStop()` |
 
-### 5.2 命令邮箱
+### 5.2 请求边界
 
-Shell/按键通过 `foc_app_PostCommand()`（perfc 中断守卫）写
-`tLifecycle.ePendingCommand`，20 kHz ISR 顶部 `foc_app_ConsumeCommand()`
-消费。`foc_app_Stop()` 先急停再投递 STOP，软件状态在下一个 ISR 边界收敛。
+Shell/产品代码直接调用 Motor API。Motor 只保留一个待处理动作；请求写入
+使用一个短临界区，20 kHz Motor 路径消费动作。INITIALIZING 或 ADC_CAL
+期间的启动请求直接返回 `FOC_RESULT_BUSY`，校准完成后仍保持 IDLE。
+Stop 先急停再收敛软件状态，不使用通用命令邮箱或 BUSY 重试协议。
 
 ### 5.3 故障位
 
@@ -133,22 +139,20 @@ Shell/按键通过 `foc_app_PostCommand()`（perfc 中断守卫）写
 
 ```text
 foc_app_HighFrequencyISR (ADC1_2_IRQHandler, 20 kHz)
- ├─ foc_app_ConsumeCommand()
- ├─ CALIBRATING: foc_app_CalibrationStep()
+ ├─ ADC_CAL: Motor calibration step (PWM off)
+ ├─ ALIGN: fixed CURRENT reference, angle zero, duty commit
  ├─ RUNNING:
- │   ├─ foc_port_CurrentSample(&tCalibration, &input)
- │   │      haladc 注入采样 ×3 → 零偏扣除 → /1390 counts/pu 归一化
- │   ├─ foc_app_AngleStep(&input)
- │   │      as5600_GetSample(缓存) → foc_encoder_Step(外推) → 机械→电换算
- │   └─ foc_core_step(&tCore, &tCommand, &input)
+ │   ├─ ADC ops current sample → persistent motor.tCycleInput
+ │   ├─ PositionPort cached ReadFeedback()
+ │   └─ foc_core_step(&tCore, &tCommand, &motor.tCycleInput)
  │          Clarke → sincos → Park → Id/Iq PI(或电压参考) → IPark → SVPWM
- │      → foc_port_DutyCommit(&tCore.tDuty) → TIM1 预装载寄存器
- │      → (float) tDiagnostics.fElectricalAngleTurns 展示值
- └─ (float) mwaveform.Step()  每拍采样 9 路变量
+ │      → PWM ops duty commit → TIM1 预装载寄存器
+ └─ mwaveform.Step()  每拍采样真实 Motor/Core 变量
 ```
 
-1 kHz `foc_app_Clock`：`as5600_Update()`（I2C 缓存）+ 速度 PI
-（SPEED 模式：电速度反馈 → Iq 参考，中断守卫写回）。
+1 kHz `foc_app_Clock` 只做 MODUS 时间维护；PositionPort 的 I2C `Poll()`
+只由 `foc_app_Run()` 调用，并由 Motor 做 1 ms 限频和失败后 100 ms 退避。
+速度 PI 在 20 kHz Motor 路径每 20 拍运行一次。
 
 ### 编码器外推（消除 1 kHz 采样阶梯）
 
@@ -160,8 +164,8 @@ foc_app_HighFrequencyISR (ADC1_2_IRQHandler, 20 kHz)
 
 ## 7. 安全不变量（`test_foc_minimal_lifecycle.c` 覆盖）
 
-1. IDLE/CALIBRATING/FAULT 下 PWM 均关闭。
-2. CALIBRATING 只读 ADC 累加零偏，不运行 FOC、不提交工作 duty。
+1. INITIALIZING/ADC_CAL/IDLE/FAULT 下 PWM 均关闭。
+2. ADC_CAL 只读 ADC 累加零偏，不运行 FOC、不提交工作 duty。
 3. RUNNING 前必须完成本次启动的零偏校准。
 4. 进入 FAULT 第一动作是 `foc_port_EmergencyStop()`。
 5. 角度无效、ADC 失败、数学失败、duty 提交失败 → FAULT。
@@ -169,23 +173,23 @@ foc_app_HighFrequencyISR (ADC1_2_IRQHandler, 20 kHz)
 7. PI 每次进入 RUNNING 前复位。
 8. 中性 duty 必须先写入预装载寄存器，再使能 PWM 主输出。
 9. 高频 ISR 中禁止日志、阻塞 I/O、动态内存和 I2C 访问。
-10. AS5600 I2C 只在 1 kHz Clock 更新，ISR 只读一致性缓存。
+10. AS5600 I2C 只在 foreground Poll 更新，ISR 只读一致性缓存。
 
 ## 8. 波形（float 版）
 
 `src/userconfig.h`：`MWAVEFORM_MAX_CHANNELS=10`、
 `MWAVEFORM_SNAPSHOT_ENABLE=0`（快照静态缓冲随关闭移除，bss 降 ~1 KB）。
-`foc_app_WaveformInit()` 注册 10 路 `AddVariable`
-（Iu/Iv/Iw/Id/Iq/Angle/Speed/Vd/Vq + EncMech，FLOAT ×1000），逐路
-检查返回值（`0xFF` 即停）；ISR 每拍 `mwaveform.Step()` 直接 volatile 采样
-对象成员内存，无 Push/快照/锁。BAM32 角度不直接注册，ISR 只写
-`tDiagnostics.fElectricalAngleTurns` 展示值。fixed 版整个波形路径编译关闭。
+`foc_app_WaveformInit()` 注册真实 Motor/Core/PositionPort 成员；ISR 每拍
+`mwaveform.Step()` 直接采样对象生命周期内的地址，无 App 镜像、浮点角度
+转换或高频 `motor_GetFeedback()` 查询。fixed 版整个波形路径编译关闭。
 
 ## 9. 关键文件
 
 | 文件 | 职责 |
 |---|---|
-| `foc/app/foc_app.c/h` | MODUS Class 对象、四态生命周期、20 kHz/1 kHz 调度、Shell、波形注册 |
+| `foc/app/foc_app.c/h` | MODUS/product glue、调度、Shell、波形注册 |
+| `foc/motor/motor.c/h` | 生命周期、请求/参考、20 kHz 控制、速度分频和反馈 |
+| `foc/motor/motor_position.h` | 缓存 PositionPort 合约 |
 | `foc/middleware/foc_core.c/h` | Clarke/Park/IPark + 电流环 PI 编排（纯数学，可 host 测试） |
 | `foc/observer/foc_encoder.c/h` | 编码器样本消费、滤波测速、拍内外推 |
 | `foc/hal/foc_port.h` | ops 表接口（pwm/adc/position）+ 默认实例声明，FOC 硬件边界 |
@@ -197,11 +201,14 @@ foc_app_HighFrequencyISR (ADC1_2_IRQHandler, 20 kHz)
 
 ### 为什么从多实例框架收敛为单实例对象
 
-旧框架（motor_handle_t 不透明句柄 + foc_hal 函数表 + plan resolver + 位置源
-接口 + 开环→闭环过渡）为多电机和复杂切换设计，但当前产品是 STM32G431 单
-电机、编码器直连，过渡分支恒为死代码。对象化重写后 App 状态归属
-`foc_app_t`，`MODUS_DECLARE_OBJECT` 生成唯一实例，文件内不再有隐藏
-runtime。
+旧框架的多层 HAL、App 位置适配器和开环状态与当前编码器闭环职责重叠。
+现在 Motor 通过四个内嵌运行态分组拥有 PositionPort、生命周期、参考和控制
+运行态；App 只保留 MODUS/product glue。未来 V/F、I/F 以虚拟 PositionPort
+接入，不向 Motor 继续添加开环字段。FOC_MODE_POSITION 当前明确返回
+FOC_RESULT_DISABLED，待位置环实现后再开放。
+
+AT32F413 没有注册 PositionPort，目标仍可编译，但 `foc_app_Init()` 明确返回
+FOC_RESULT_DISABLED，避免在无位置反馈时伪造运行时 FOC。
 
 ### 为什么硬件接口用 ops 注入而非编译期函数
 
@@ -209,9 +216,9 @@ runtime。
 换来固定调用链；代价是每加一种外设/芯片/传感器都要改 `foc_port.h` 签名
 或加条件编译，foc 内部无法与具体硬件解耦。ops 注入（策略模式）把
 PWM/ADC/位置反馈抽象为三张表（`foc_pwm_ops_t`/`foc_adc_ops_t`/
-`foc_position_ops_t`），foc 内部只面向接口：
+`motor_position_ops_t`），foc 内部只面向接口：
 
-- **加传感器**（如霍尔）：新增一个 `foc_position_ops_t` 实例注入槽位，
+- **加传感器**（如霍尔）：新增一个 `motor_position_ops_t` 实例注入槽位，
   foc 内部零改动；
 - **换芯片**：更换 `foc_port.c` 提供的默认 ops 表，foc 内部零改动；
 - **20 kHz 性能**：ops 函数指针在 -flto 下内联为直接调用，成本趋零

@@ -213,29 +213,53 @@ const foc_adc_ops_t g_tFocAdcOps = {
 };
 
 #if defined(MDI_HW_HAS_I2C_ENCODER)
-static as5600_sensor_t s_tBoardSensor;
+as5600_sensor_t g_tFocPositionSensor;
 
-const foc_sensor_t g_tFocSensor = {
-    .ptOps = &g_tAs5600SensorOps,
-    .pPriv = &s_tBoardSensor,
-};
-
-int32_t foc_port_SensorInit(const foc_encoder_params_t *ptParams)
+static foc_result_t foc_port_As5600Init(
+    void *pContext,
+    const motor_params_t *ptMotor,
+    foc_scalar_t qHighFrequencyPeriod,
+    const foc_encoder_params_t *ptEncoderParams)
 {
-    if (HW.ptI2c1 == NULL || ptParams == NULL) {
-        return -1;
+    as5600_sensor_t *ptSensor = (as5600_sensor_t *)pContext;
+
+    if (ptSensor == NULL || HW.ptI2c1 == NULL || ptEncoderParams == NULL) {
+        return FOC_RESULT_INVALID_ARGUMENT;
     }
-    return as5600_sensor_Init(&s_tBoardSensor, HW.ptI2c1, ptParams);
+    if (as5600_sensor_Init(ptSensor, HW.ptI2c1) != 0) {
+        return FOC_RESULT_INVALID_ARGUMENT;
+    }
+    return g_tAs5600PositionOps.fnInit(
+        ptSensor, ptMotor, qHighFrequencyPeriod, ptEncoderParams);
 }
-#else
-const foc_sensor_t g_tFocSensor = {
-    .ptOps = NULL,
-    .pPriv = NULL,
+
+static void foc_port_PositionReset(void *pContext)
+{
+    g_tAs5600PositionOps.fnReset(pContext);
+}
+
+static foc_result_t foc_port_PositionPoll(void *pContext)
+{
+    return g_tAs5600PositionOps.fnPoll(pContext);
+}
+
+static foc_result_t foc_port_PositionRead(
+    void *pContext, motor_position_feedback_t *ptFeedback)
+{
+    return g_tAs5600PositionOps.fnReadFeedback(pContext, ptFeedback);
+}
+
+static foc_result_t foc_port_PositionCaptureZero(void *pContext)
+{
+    return g_tAs5600PositionOps.fnCaptureZero(pContext);
+}
+
+const motor_position_ops_t g_tFocPositionOps = {
+    .fnInit = foc_port_As5600Init,
+    .fnReset = foc_port_PositionReset,
+    .fnPoll = foc_port_PositionPoll,
+    .fnReadFeedback = foc_port_PositionRead,
+    .fnCaptureZero = foc_port_PositionCaptureZero,
 };
 
-int32_t foc_port_SensorInit(const foc_encoder_params_t *ptParams)
-{
-    (void)ptParams;
-    return 0;
-}
 #endif

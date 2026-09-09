@@ -1,43 +1,37 @@
 /****************************************************************************
  * @file    motor_position.h
- * @brief   Minimal single-active-source position provider interface.
+ * @brief   Cached position-feedback boundary owned by Motor.
  * @author  Codex
- * @date    2026-09-08
+ * @date    2026-09-09
  ****************************************************************************/
 
 #ifndef MOTOR_POSITION_H
 #define MOTOR_POSITION_H
 
 #include <stdbool.h>
-#include <stdint.h>
 
+#include "foc_encoder.h"
 #include "foc_types.h"
 #include "motor_params.h"
 
 typedef struct {
     foc_angle_t tElectricalAngle;
     foc_scalar_t qElectricalSpeed;
+    foc_angle_t tMechanicalAngle;
+    foc_scalar_t qMechanicalSpeed;
     bool bValid;
 } motor_position_feedback_t;
 
 typedef struct {
-    foc_ab_t tCurrent;
-    foc_ab_t tAppliedVoltage;
-    foc_scalar_t qBusVoltage;
-    foc_scalar_t qSamplePeriod;
-} foc_observer_input_t;
-
-typedef struct {
     foc_result_t (*fnInit)(void *pContext,
                            const motor_params_t *ptMotor,
-                           foc_scalar_t qHighFrequencyPeriod);
+                           foc_scalar_t qHighFrequencyPeriod,
+                           const foc_encoder_params_t *ptEncoder);
     void (*fnReset)(void *pContext);
-    int32_t (*fnSlowUpdate)(void *pContext);
-    foc_result_t (*fnObserve)(void *pContext,
-                              const foc_observer_input_t *ptInput);
-    foc_result_t (*fnRead)(void *pContext,
-                           motor_position_feedback_t *ptFeedback);
-    foc_result_t (*fnCaptureElectricalZero)(void *pContext);
+    foc_result_t (*fnPoll)(void *pContext);
+    foc_result_t (*fnReadFeedback)(
+        void *pContext, motor_position_feedback_t *ptFeedback);
+    foc_result_t (*fnCaptureZero)(void *pContext);
 } motor_position_ops_t;
 
 typedef struct {

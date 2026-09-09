@@ -10,7 +10,7 @@
 
 static bool core_mode_is_valid(foc_control_mode_e eMode)
 {
-    return eMode <= FOC_MODE_SPEED;
+    return eMode < FOC_MODE_MAX;
 }
 
 static foc_result_t core_validate_inputs(const foc_core_state_t *ptState,
@@ -19,6 +19,9 @@ static foc_result_t core_validate_inputs(const foc_core_state_t *ptState,
 {
     if (ptState == NULL || ptCommand == NULL || ptInput == NULL) {
         return FOC_RESULT_NULL;
+    }
+    if (ptCommand->eMode == FOC_MODE_POSITION) {
+        return FOC_RESULT_DISABLED;
     }
     if (!ptInput->bAngleValid) {
         return FOC_RESULT_SAFETY;

@@ -8,6 +8,7 @@ CPU_FLAGS = -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16
 
 # Chip preprocessor defines
 C_DEFS += -DAT32F413RCT7 -DUSE_STDPERIPH_DRIVER -DFOC_SUPPORT=1 -DAT_MOTOR_EVB_V1 -DCORE_DEBUG_OVERRIDE_FAULT_HANDLER
+C_DEFS += -DFOC_PORT_HAS_POSITION=0
 
 # CMSIS / peripheral library paths
 CHIPLIB_ROOT = vendor/cortex-m/AT32F413_Firmware_Library/libraries
@@ -113,4 +114,3 @@ OPENOCD_SCRIPTS = $(SW_ROOT)/msys64/mingw64/share/openocd/scripts
 
 # 启用 MODUS 默认内置的 perf_counter 移植
 MODUS_USE_DEFAULT_PERFC_PORT = 1
-

@@ -91,10 +91,10 @@ static foc_angle_t encoder_extrapolated_angle(
     foc_scalar_t qTurns = FOC_ZERO;
 
     if (encoder_should_extrapolate(ptEncoder->qMechanicalSpeed,
-                                   ptEncoder->tParams.chPolePairs)) {
+                                   ptEncoder->chPolePairs)) {
 #if defined(FOC_NUMERIC_FIXED)
         int64_t llTurns = (int64_t)ptEncoder->qMechanicalSpeed *
-                          (int64_t)ptEncoder->tParams.qHighFrequencyPeriod;
+                          (int64_t)ptEncoder->qHighFrequencyPeriod;
         llTurns = (llTurns / FOC_Q_SCALE) *
                   (int64_t)ptEncoder->hwTicksSinceSample;
         if (llTurns > INT32_MAX) {
@@ -107,7 +107,7 @@ static foc_angle_t encoder_extrapolated_angle(
         qTurns = (foc_scalar_t)llTurns;
 #else
         qTurns = ptEncoder->qMechanicalSpeed *
-                 ptEncoder->tParams.qHighFrequencyPeriod *
+                 ptEncoder->qHighFrequencyPeriod *
                  (foc_scalar_t)ptEncoder->hwTicksSinceSample;
 #endif
     }
@@ -119,37 +119,44 @@ void foc_encoder_DefaultParams(foc_encoder_params_t *ptParams)
     if (ptParams != NULL) {
         ptParams->qSpeedFilterAlpha = FOC_SCALAR(0.25f);
         ptParams->hwInvalidTimeout = 100U;  /* 5 ms @20 kHz */
-        ptParams->chPolePairs = 1U;
-        ptParams->qHighFrequencyPeriod = FOC_SCALAR(0.00005f);
     }
 }
 
 foc_result_t foc_encoder_Init(foc_encoder_t *ptEncoder,
-                              const foc_encoder_params_t *ptParams)
+                              const foc_encoder_params_t *ptParams,
+                              uint8_t chPolePairs,
+                              foc_scalar_t qHighFrequencyPeriod)
 {
     if (ptEncoder == NULL || ptParams == NULL) {
         return FOC_RESULT_NULL;
     }
     if (ptParams->qSpeedFilterAlpha < FOC_ZERO ||
         ptParams->qSpeedFilterAlpha > FOC_ONE ||
-        ptParams->hwInvalidTimeout == 0U ||
-        ptParams->chPolePairs == 0U ||
-        ptParams->qHighFrequencyPeriod <= FOC_ZERO) {
+        ptParams->hwInvalidTimeout == 0U || chPolePairs == 0U ||
+        qHighFrequencyPeriod <= FOC_ZERO) {
         return FOC_RESULT_INVALID_ARGUMENT;
     }
     memset(ptEncoder, 0, sizeof(*ptEncoder));
     ptEncoder->tParams = *ptParams;
+    ptEncoder->chPolePairs = chPolePairs;
+    ptEncoder->qHighFrequencyPeriod = qHighFrequencyPeriod;
     return FOC_RESULT_OK;
 }
 
 void foc_encoder_Reset(foc_encoder_t *ptEncoder)
 {
-    foc_encoder_params_t tParams;
+    foc_encoder_params_t tParams = {0};
+    uint8_t chPolePairs = 0U;
+    foc_scalar_t qHighFrequencyPeriod = FOC_ZERO;
 
     if (ptEncoder != NULL) {
         tParams = ptEncoder->tParams;
+        chPolePairs = ptEncoder->chPolePairs;
+        qHighFrequencyPeriod = ptEncoder->qHighFrequencyPeriod;
         memset(ptEncoder, 0, sizeof(*ptEncoder));
         ptEncoder->tParams = tParams;
+        ptEncoder->chPolePairs = chPolePairs;
+        ptEncoder->qHighFrequencyPeriod = qHighFrequencyPeriod;
     }
 }
 
@@ -197,7 +204,7 @@ foc_result_t foc_encoder_Step(foc_encoder_t *ptEncoder,
             foc_scalar_t qRawSpeed =
                 encoder_sample_speed(nDelta,
                                      ptEncoder->hwTicksSinceSample,
-                                     ptEncoder->tParams.qHighFrequencyPeriod);
+                                     ptEncoder->qHighFrequencyPeriod);
             foc_scalar_t qSpeedDelta =
                 foc_sub_sat(qRawSpeed, ptEncoder->qMechanicalSpeed);
 

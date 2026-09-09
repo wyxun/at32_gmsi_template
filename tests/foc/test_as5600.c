@@ -64,20 +64,20 @@ static int test_slow_update_and_fast_read_are_separate(void)
     uint32_t wBusCalls = 0U;
 
     foc_encoder_DefaultParams(&tEncoderParams);
-    if (as5600_sensor_Init(&tSensor, &tIic, &tEncoderParams) != 0) {
+    if (as5600_sensor_Init(&tSensor, &tIic) != 0) {
         return 1;
     }
     if (g_tAs5600PositionOps.fnInit(
-            &tSensor, &tMotorParams,
-            FOC_SCALAR(0.00005f)) != FOC_RESULT_OK) {
+            &tSensor, &tMotorParams, FOC_SCALAR(0.00005f),
+            &tEncoderParams) != FOC_RESULT_OK) {
         return 1;
     }
-    if (g_tAs5600PositionOps.fnSlowUpdate(&tSensor) != 0) {
+    if (g_tAs5600PositionOps.fnPoll(&tSensor) != FOC_RESULT_OK) {
         return 1;
     }
     wBusCalls = tBus.wWriteCalls + tBus.wReadCalls;
     if (wBusCalls == 0U ||
-        g_tAs5600PositionOps.fnRead(&tSensor, &tFeedback) !=
+        g_tAs5600PositionOps.fnReadFeedback(&tSensor, &tFeedback) !=
             FOC_RESULT_OK || !tFeedback.bValid) {
         return 1;
     }

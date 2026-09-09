@@ -20,12 +20,12 @@
 typedef struct {
     foc_scalar_t qSpeedFilterAlpha;     /**< 速度低通滤波系数 [0, 1] */
     uint16_t     hwInvalidTimeout;      /**< 无效样本超时，单位 tick */
-    uint8_t      chPolePairs;           /**< 极对数（外推门限） */
-    foc_scalar_t qHighFrequencyPeriod;  /**< 高频周期 (s) */
 } foc_encoder_params_t;
 
 typedef struct {
     foc_encoder_params_t tParams;       /**< 参数（Init 后不变） */
+    uint8_t      chPolePairs;           /**< 运行时极对数 */
+    foc_scalar_t qHighFrequencyPeriod;  /**< 运行时高频周期 (s) */
     foc_angle_t  tMechanicalAngle;      /**< 状态：机械角度 */
     foc_scalar_t qMechanicalSpeed;      /**< 状态：机械速度 (turn/s) */
     uint32_t     wLastSequence;         /**< 状态：上次消费的样本序号 */
@@ -59,7 +59,9 @@ void foc_encoder_DefaultParams(foc_encoder_params_t *ptParams);
  * @return FOC_RESULT_OK 或错误码
  */
 foc_result_t foc_encoder_Init(foc_encoder_t *ptEncoder,
-                              const foc_encoder_params_t *ptParams);
+                              const foc_encoder_params_t *ptParams,
+                              uint8_t chPolePairs,
+                              foc_scalar_t qHighFrequencyPeriod);
 
 /**
  * @brief 复位编码器观测器状态（保留参数）

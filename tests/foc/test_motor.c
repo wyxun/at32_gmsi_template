@@ -1,10 +1,10 @@
 #include <stdio.h>
-#include <string.h>
 
 #include "motor.h"
 
 static uint32_t s_wCriticalEnterCalls;
 static uint32_t s_wCriticalExitCalls;
+static int64_t s_lNowMs;
 
 void perfc_test_CriticalEnter(void)
 {
@@ -16,53 +16,40 @@ void perfc_test_CriticalExit(void)
     s_wCriticalExitCalls++;
 }
 
-static void test_reset_critical_counts(void)
+int64_t get_system_ms(void)
 {
-    s_wCriticalEnterCalls = 0U;
-    s_wCriticalExitCalls = 0U;
-}
-
-static bool test_critical_was_balanced(void)
-{
-    return s_wCriticalEnterCalls > 0U &&
-           s_wCriticalEnterCalls == s_wCriticalExitCalls;
+    return s_lNowMs;
 }
 
 typedef struct {
-    uint32_t wInitCalls;
-    uint32_t wContextTag;
-    uint32_t wCalibrationBeginCalls;
-    uint32_t wCalibrationStepCalls;
-    uint32_t wCurrentSampleCalls;
-    uint32_t wPositionReadCalls;
-    uint32_t wSlowUpdateCalls;
-    uint32_t wCaptureCalls;
-    foc_scalar_t qElectricalSpeed;
+    uint32_t wCalibrationSteps;
+    uint32_t wPolls;
+    uint32_t wReads;
+    uint32_t wCaptures;
+    uint32_t wDutyCommits;
+    uint32_t wEnableCalls;
+    uint32_t wEmergencyStops;
+    uint32_t wCalibrationLimit;
+    uint32_t wAlignLimit;
+    foc_scalar_t qSpeed;
     foc_scalar_t qIu;
     foc_scalar_t qIv;
     foc_scalar_t qIw;
-    uint32_t wDutyCommitCalls;
-    uint32_t wPwmEnableCalls;
-    uint32_t wEmergencyStopCalls;
     bool bPwmEnabled;
-    bool bPositionValid;
-    bool bAdcCalibrationBusy;
-    bool bZeroCaptured;
-} motor_test_context_t;
+    bool bFeedbackValid;
+    bool bCalibrationFails;
+    bool bPollFails;
+} motor_fake_t;
 
-static foc_result_t test_position_init(
-    void *pContext,
-    const motor_params_t *ptMotor,
-    foc_scalar_t qHighFrequencyPeriod)
+static foc_result_t test_position_init(void *pContext,
+                                       const motor_params_t *ptMotor,
+                                       foc_scalar_t qHighFrequencyPeriod,
+                                       const foc_encoder_params_t *ptEncoder)
 {
-    motor_test_context_t *ptContext = (motor_test_context_t *)pContext;
-
-    if (ptContext == NULL || ptMotor == NULL ||
-        qHighFrequencyPeriod <= FOC_ZERO) {
-        return FOC_RESULT_INVALID_ARGUMENT;
-    }
-    ptContext->wInitCalls++;
-    return FOC_RESULT_OK;
+    (void)pContext;
+    return ptMotor == NULL || ptEncoder == NULL ||
+                   qHighFrequencyPeriod <= FOC_ZERO
+               ? FOC_RESULT_NULL : FOC_RESULT_OK;
 }
 
 static void test_position_reset(void *pContext)
@@ -70,116 +57,93 @@ static void test_position_reset(void *pContext)
     (void)pContext;
 }
 
-static int32_t test_position_slow_update(void *pContext)
+static foc_result_t test_position_poll(void *pContext)
 {
-    motor_test_context_t *ptContext = (motor_test_context_t *)pContext;
+    motor_fake_t *ptFake = (motor_fake_t *)pContext;
 
-    if (ptContext != NULL) {
-        ptContext->wSlowUpdateCalls++;
+    if (ptFake == NULL) {
+        return FOC_RESULT_NULL;
     }
-    return 0;
+    ptFake->wPolls++;
+    return ptFake->bPollFails ? FOC_RESULT_SAFETY : FOC_RESULT_OK;
 }
 
 static foc_result_t test_position_read(
-    void *pContext,
-    motor_position_feedback_t *ptFeedback)
+    void *pContext, motor_position_feedback_t *ptFeedback)
 {
-    motor_test_context_t *ptContext = (motor_test_context_t *)pContext;
+    motor_fake_t *ptFake = (motor_fake_t *)pContext;
 
-    if (ptFeedback == NULL) {
+    if (ptFake == NULL || ptFeedback == NULL) {
         return FOC_RESULT_NULL;
     }
-    if (ptContext != NULL) {
-        ptContext->wPositionReadCalls++;
-    }
+    ptFake->wReads++;
     ptFeedback->tElectricalAngle = (foc_angle_t){0U};
-    ptFeedback->qElectricalSpeed = ptContext == NULL
-                                       ? FOC_ZERO
-                                       : ptContext->qElectricalSpeed;
-    ptFeedback->bValid = ptContext != NULL && ptContext->bPositionValid;
+    ptFeedback->qElectricalSpeed = ptFake->qSpeed;
+    ptFeedback->tMechanicalAngle = (foc_angle_t){0U};
+    ptFeedback->qMechanicalSpeed = FOC_ZERO;
+    ptFeedback->bValid = ptFake->bFeedbackValid;
+    return FOC_RESULT_OK;
+}
+
+static foc_result_t test_position_capture(void *pContext)
+{
+    motor_fake_t *ptFake = (motor_fake_t *)pContext;
+
+    if (ptFake == NULL) {
+        return FOC_RESULT_NULL;
+    }
+    ptFake->wCaptures++;
     return FOC_RESULT_OK;
 }
 
 static const motor_position_ops_t s_tPositionOps = {
     .fnInit = test_position_init,
     .fnReset = test_position_reset,
-    .fnSlowUpdate = test_position_slow_update,
-    .fnObserve = NULL,
-    .fnRead = test_position_read,
-    .fnCaptureElectricalZero = NULL,
-};
-
-static foc_result_t test_position_capture_zero(void *pContext)
-{
-    motor_test_context_t *ptContext = (motor_test_context_t *)pContext;
-
-    if (ptContext == NULL) {
-        return FOC_RESULT_NULL;
-    }
-    ptContext->wCaptureCalls++;
-    if (!ptContext->bPositionValid) {
-        return FOC_RESULT_SAFETY;
-    }
-    ptContext->bZeroCaptured = true;
-    return FOC_RESULT_OK;
-}
-
-static const motor_position_ops_t s_tCapturePositionOps = {
-    .fnInit = test_position_init,
-    .fnReset = test_position_reset,
-    .fnSlowUpdate = test_position_slow_update,
-    .fnObserve = NULL,
-    .fnRead = test_position_read,
-    .fnCaptureElectricalZero = test_position_capture_zero,
+    .fnPoll = test_position_poll,
+    .fnReadFeedback = test_position_read,
+    .fnCaptureZero = test_position_capture,
 };
 
 static void test_adc_begin(void *pContext,
                            foc_adc_calib_t *ptCalibration)
 {
-    motor_test_context_t *ptContext = (motor_test_context_t *)pContext;
-
-    if (ptContext != NULL) {
-        ptContext->wCalibrationBeginCalls++;
-    }
     (void)pContext;
-    if (ptCalibration == NULL) {
-        return;
+    if (ptCalibration != NULL) {
+        *ptCalibration = (foc_adc_calib_t){0};
     }
-    memset(ptCalibration, 0, sizeof(*ptCalibration));
 }
 
 static foc_calibration_state_e test_adc_step(
-    void *pContext,
-    foc_adc_calib_t *ptCalibration)
+    void *pContext, foc_adc_calib_t *ptCalibration)
 {
-    motor_test_context_t *ptContext = (motor_test_context_t *)pContext;
+    motor_fake_t *ptFake = (motor_fake_t *)pContext;
 
-    if (ptContext != NULL) {
-        ptContext->wCalibrationStepCalls++;
-    }
     (void)ptCalibration;
-    if (ptContext != NULL && ptContext->bAdcCalibrationBusy) {
-        return FOC_CALIBRATION_BUSY;
+    if (ptFake == NULL) {
+        return FOC_CALIBRATION_FAILED;
     }
-    return FOC_CALIBRATION_COMPLETE;
+    ptFake->wCalibrationSteps++;
+    if (ptFake->bCalibrationFails) {
+        return FOC_CALIBRATION_FAILED;
+    }
+    return ptFake->wCalibrationSteps >= ptFake->wCalibrationLimit
+               ? FOC_CALIBRATION_COMPLETE : FOC_CALIBRATION_BUSY;
 }
 
 static foc_result_t test_adc_sample(
-    void *pContext,
-    const foc_adc_calib_t *ptCalibration,
+    void *pContext, const foc_adc_calib_t *ptCalibration,
     foc_core_input_t *ptInput)
 {
-    motor_test_context_t *ptContext = (motor_test_context_t *)pContext;
+    motor_fake_t *ptFake = (motor_fake_t *)pContext;
 
-    if (ptContext != NULL) {
-        ptContext->wCurrentSampleCalls++;
-    }
     (void)ptCalibration;
-    if (ptInput != NULL && ptContext != NULL) {
-        ptInput->qIu = ptContext->qIu;
-        ptInput->qIv = ptContext->qIv;
-        ptInput->qIw = ptContext->qIw;
+    if (ptFake == NULL || ptInput == NULL) {
+        return FOC_RESULT_NULL;
     }
+    ptInput->qIu = ptFake->qIu;
+    ptInput->qIv = ptFake->qIv;
+    ptInput->qIw = ptFake->qIw;
+    ptInput->bAngleValid = true;
     return FOC_RESULT_OK;
 }
 
@@ -192,34 +156,34 @@ static const foc_adc_ops_t s_tAdcOps = {
 static foc_result_t test_duty_commit(void *pContext,
                                      const foc_duty_abc_t *ptDuty)
 {
-    motor_test_context_t *ptContext = (motor_test_context_t *)pContext;
+    motor_fake_t *ptFake = (motor_fake_t *)pContext;
 
-    if (ptContext != NULL) {
-        ptContext->wDutyCommitCalls++;
+    if (ptFake == NULL || ptDuty == NULL) {
+        return FOC_RESULT_NULL;
     }
-    (void)ptDuty;
+    ptFake->wDutyCommits++;
     return FOC_RESULT_OK;
 }
 
 static foc_result_t test_pwm_enable(void *pContext, bool bEnable)
 {
-    motor_test_context_t *ptContext = (motor_test_context_t *)pContext;
+    motor_fake_t *ptFake = (motor_fake_t *)pContext;
 
-    if (ptContext != NULL) {
-        ptContext->wPwmEnableCalls++;
-        ptContext->bPwmEnabled = bEnable;
+    if (ptFake == NULL) {
+        return FOC_RESULT_NULL;
     }
-    (void)bEnable;
+    ptFake->wEnableCalls++;
+    ptFake->bPwmEnabled = bEnable;
     return FOC_RESULT_OK;
 }
 
 static void test_emergency_stop(void *pContext)
 {
-    motor_test_context_t *ptContext = (motor_test_context_t *)pContext;
+    motor_fake_t *ptFake = (motor_fake_t *)pContext;
 
-    if (ptContext != NULL) {
-        ptContext->wEmergencyStopCalls++;
-        ptContext->bPwmEnabled = false;
+    if (ptFake != NULL) {
+        ptFake->wEmergencyStops++;
+        ptFake->bPwmEnabled = false;
     }
 }
 
@@ -229,654 +193,275 @@ static const foc_pwm_ops_t s_tPwmOps = {
     .fnEmergencyStop = test_emergency_stop,
 };
 
-static motor_cfg_t test_config(motor_test_context_t *ptContext)
+static foc_pid_params_t test_pi_params(float fOutput)
 {
-    motor_cfg_t tConfig = {
-        .tMotorParams = {
-            .qResistance = FOC_SCALAR(0.1f),
-            .qInductanceD = FOC_SCALAR(0.1f),
-            .qInductanceQ = FOC_SCALAR(0.1f),
-            .qFlux = FOC_SCALAR(0.1f),
-            .wValidMask = MOTOR_PARAM_VALID_RS |
-                          MOTOR_PARAM_VALID_LD |
-                          MOTOR_PARAM_VALID_LQ |
-                          MOTOR_PARAM_VALID_FLUX,
-            .chPolePairs = 7U,
-        },
-        .tControlCfg = {
-            .tCurrentPiParams = {
-                .tKp = {0, FOC_SCALAR(0.20f)},
-                .tKiTs = {0, FOC_SCALAR(0.005f)},
-                .tKdOverTs = {0, FOC_ZERO},
-                .qOutputMinimum = FOC_SCALAR(-0.55f),
-                .qOutputMaximum = FOC_SCALAR(0.55f),
-                .qIntegratorMinimum = FOC_SCALAR(-0.50f),
-                .qIntegratorMaximum = FOC_SCALAR(0.50f),
-            },
-            .tSpeedPiParams = {
-                .tKp = {0, FOC_SCALAR(0.20f)},
-                .tKiTs = {0, FOC_SCALAR(0.005f)},
-                .tKdOverTs = {0, FOC_ZERO},
-                .qOutputMinimum = FOC_SCALAR(-0.10f),
-                .qOutputMaximum = FOC_SCALAR(0.10f),
-                .qIntegratorMinimum = FOC_SCALAR(-0.10f),
-                .qIntegratorMaximum = FOC_SCALAR(0.10f),
-            },
-            .qHighFrequencyPeriod = FOC_SCALAR(0.00005f),
-            .hwCalibrationTimeoutTicks = 2000U,
-        },
-        .ptAdcOps = &s_tAdcOps,
-        .pAdcContext = ptContext,
-        .ptPwmOps = &s_tPwmOps,
-        .pPwmContext = ptContext,
-        .tPosition = {
-            .ptOps = &s_tPositionOps,
-            .pContext = ptContext,
-        },
+    foc_pid_params_t tParams = {
+        .tKp = {0, FOC_SCALAR(0.20f)},
+        .tKiTs = {0, FOC_SCALAR(0.005f)},
+        .qOutputMinimum = FOC_SCALAR(-fOutput),
+        .qOutputMaximum = FOC_SCALAR(fOutput),
+        .qIntegratorMinimum = FOC_SCALAR(-fOutput),
+        .qIntegratorMaximum = FOC_SCALAR(fOutput),
     };
 
-    return tConfig;
+    return tParams;
 }
 
-static motor_cfg_t test_cal_config(motor_test_context_t *ptContext)
+static motor_cfg_t test_config(motor_fake_t *ptFake)
 {
-    motor_cfg_t tConfig = test_config(ptContext);
+    motor_cfg_t tConfig = {0};
 
+    tConfig.tMotorParams.chPolePairs = 7U;
+    tConfig.tEncoderParams.qSpeedFilterAlpha = FOC_SCALAR(0.25f);
+    tConfig.tEncoderParams.hwInvalidTimeout = 100U;
+    tConfig.tControlCfg.tCurrentPiParams = test_pi_params(0.55f);
+    tConfig.tControlCfg.tSpeedPiParams = test_pi_params(0.10f);
+    tConfig.tControlCfg.qHighFrequencyPeriod = FOC_SCALAR(0.00005f);
+    tConfig.tControlCfg.qPositionCalibrationCurrent =
+        FOC_SCALAR(0.10f);
+    tConfig.tControlCfg.qSpeedIqLimit = FOC_SCALAR(0.10f);
+    tConfig.tControlCfg.hwCalibrationTimeoutTicks = 2000U;
     tConfig.tControlCfg.wPositionCalibrationTicks = 5U;
-    tConfig.tPosition.ptOps = &s_tCapturePositionOps;
+    tConfig.ptAdcOps = &s_tAdcOps;
+    tConfig.pAdcContext = ptFake;
+    tConfig.ptPwmOps = &s_tPwmOps;
+    tConfig.pPwmContext = ptFake;
+    tConfig.tPosition.ptOps = &s_tPositionOps;
+    tConfig.tPosition.pContext = ptFake;
     return tConfig;
 }
 
-static int test_rejects_invalid_configuration(void)
+static void test_init_to_idle(motor_t *ptMotor, motor_fake_t *ptFake)
+{
+    motor_cfg_t tConfig = test_config(ptFake);
+
+    ptFake->wCalibrationLimit = 1U;
+    (void)motor_Init(ptMotor, &tConfig);
+    motor_HighFrequencyStep(ptMotor);
+    motor_HighFrequencyStep(ptMotor);
+}
+
+static int test_adc_cal_never_enables_pwm(void)
 {
     motor_t tMotor = {0};
-    motor_test_context_t tContext = {0};
-    motor_cfg_t tConfig = test_config(&tContext);
+    motor_fake_t tFake = {.wCalibrationLimit = 100U};
+    motor_cfg_t tConfig = test_config(&tFake);
 
-    tConfig.tMotorParams.chPolePairs = 0U;
-    return motor_Init(&tMotor, &tConfig) == FOC_RESULT_INVALID_ARGUMENT
+    if (motor_Init(&tMotor, &tConfig) != FOC_RESULT_OK) {
+        return 1;
+    }
+    motor_HighFrequencyStep(&tMotor);
+    motor_HighFrequencyStep(&tMotor);
+    return tMotor.tLifecycle.eLifecycle == MOTOR_STATE_ADC_CAL &&
+                   !tFake.bPwmEnabled && tFake.wEnableCalls == 0U
                ? 0 : 1;
 }
 
-static int test_binds_two_contexts(void)
+static int test_start_during_adc_cal_is_busy(void)
+{
+    motor_t tMotor = {0};
+    motor_fake_t tFake = {.wCalibrationLimit = 2U};
+    motor_cfg_t tConfig = test_config(&tFake);
+
+    if (motor_Init(&tMotor, &tConfig) != FOC_RESULT_OK) {
+        return 1;
+    }
+    if (motor_Start(&tMotor, FOC_MODE_CURRENT) != FOC_RESULT_BUSY) {
+        return 1;
+    }
+    motor_HighFrequencyStep(&tMotor);
+    motor_HighFrequencyStep(&tMotor);
+    if (tMotor.tLifecycle.eLifecycle != MOTOR_STATE_ADC_CAL ||
+        motor_Start(&tMotor, FOC_MODE_CURRENT) != FOC_RESULT_BUSY) {
+        return 1;
+    }
+    motor_HighFrequencyStep(&tMotor);
+    return tMotor.tLifecycle.eLifecycle == MOTOR_STATE_IDLE &&
+                   !tFake.bPwmEnabled
+               ? 0 : 1;
+}
+
+static int test_typed_references_and_start(void)
+{
+    motor_t tMotor = {0};
+    motor_fake_t tFake = {.wCalibrationLimit = 1U,
+                          .bFeedbackValid = true};
+    motor_status_t tStatus = {0};
+
+    test_init_to_idle(&tMotor, &tFake);
+    if (motor_SetVoltageReference(&tMotor, FOC_ZERO,
+                                  FOC_SCALAR(0.05f)) != FOC_RESULT_OK ||
+        motor_SetCurrentReference(&tMotor, FOC_ZERO,
+                                  FOC_SCALAR(0.05f)) != FOC_RESULT_OK ||
+        motor_SetSpeedReference(&tMotor, FOC_SCALAR(20.0f)) !=
+            FOC_RESULT_OK ||
+        motor_SetPositionReference(&tMotor, (foc_angle_t){1U}) !=
+            FOC_RESULT_DISABLED ||
+        motor_Start(&tMotor, FOC_MODE_CURRENT) != FOC_RESULT_OK) {
+        return 1;
+    }
+    motor_HighFrequencyStep(&tMotor);
+    if (motor_GetStatus(&tMotor, &tStatus) != FOC_RESULT_OK ||
+        tStatus.eMode != FOC_MODE_CURRENT || !tFake.bPwmEnabled) {
+        return 1;
+    }
+    return motor_SetVoltageReference(&tMotor, FOC_ZERO, FOC_ZERO) ==
+                   FOC_RESULT_INVALID_ARGUMENT
+               ? 0 : 1;
+}
+
+static int test_speed_pi_runs_once_per_twenty_ticks(void)
+{
+    motor_t tMotor = {0};
+    motor_fake_t tFake = {.wCalibrationLimit = 1U,
+                          .bFeedbackValid = true,
+                          .qSpeed = FOC_ZERO};
+    foc_scalar_t qIntegrator = FOC_ZERO;
+    uint32_t wIndex = 0U;
+
+    test_init_to_idle(&tMotor, &tFake);
+    if (motor_SetSpeedReference(&tMotor, FOC_SCALAR(0.20f)) !=
+            FOC_RESULT_OK ||
+        motor_Start(&tMotor, FOC_MODE_SPEED) != FOC_RESULT_OK) {
+        return 1;
+    }
+    motor_HighFrequencyStep(&tMotor);
+    qIntegrator = tMotor.tControl.tSpeedPi.qIntegrator;
+    for (wIndex = 0U; wIndex < 19U; wIndex++) {
+        motor_HighFrequencyStep(&tMotor);
+    }
+    if (tMotor.tControl.tSpeedPi.qIntegrator != qIntegrator) {
+        return 1;
+    }
+    motor_HighFrequencyStep(&tMotor);
+    if (tMotor.tControl.tSpeedPi.qIntegrator == qIntegrator) {
+        return 1;
+    }
+    return 0;
+}
+
+static int test_alignment_requires_adc_and_exits_safe(void)
+{
+    motor_t tMotor = {0};
+    motor_fake_t tFake = {.wCalibrationLimit = 1U,
+                          .bFeedbackValid = true};
+    uint32_t wIndex = 0U;
+
+    test_init_to_idle(&tMotor, &tFake);
+    if (motor_RequestPositionCalibration(&tMotor) != FOC_RESULT_OK) {
+        return 1;
+    }
+    motor_HighFrequencyStep(&tMotor);
+    if (tMotor.tLifecycle.eLifecycle != MOTOR_STATE_ALIGN ||
+        !tFake.bPwmEnabled ||
+        tMotor.tControl.tCurrentReference.qD != FOC_SCALAR(0.10f) ||
+        tMotor.tControl.tCurrentReference.qQ != FOC_ZERO ||
+        tMotor.tControl.tCore.tVoltage.qD <= FOC_ZERO ||
+        tMotor.tControl.tCore.tVoltage.qQ != FOC_ZERO) {
+        return 1;
+    }
+    for (wIndex = 0U; wIndex < 5U; wIndex++) {
+        motor_HighFrequencyStep(&tMotor);
+    }
+    motor_BackgroundStep(&tMotor);
+    return tMotor.tLifecycle.eLifecycle == MOTOR_STATE_IDLE &&
+                   !tFake.bPwmEnabled && tFake.wCaptures == 1U
+               ? 0 : 1;
+}
+
+static int test_two_instances_have_independent_speed_pi(void)
 {
     motor_t tMotorA = {0};
     motor_t tMotorB = {0};
-    motor_test_context_t tContextA = {0};
-    motor_test_context_t tContextB = {0};
-    motor_cfg_t tConfigA = test_config(&tContextA);
-    motor_cfg_t tConfigB = test_config(&tContextB);
+    motor_fake_t tFakeA = {.wCalibrationLimit = 1U,
+                           .bFeedbackValid = true};
+    motor_fake_t tFakeB = {.wCalibrationLimit = 1U,
+                           .bFeedbackValid = true};
 
-    if (motor_Init(&tMotorA, &tConfigA) != FOC_RESULT_OK ||
-        motor_Init(&tMotorB, &tConfigB) != FOC_RESULT_OK) {
+    test_init_to_idle(&tMotorA, &tFakeA);
+    test_init_to_idle(&tMotorB, &tFakeB);
+    if (motor_SetSpeedReference(&tMotorA, FOC_SCALAR(0.20f)) !=
+            FOC_RESULT_OK ||
+        motor_Start(&tMotorA, FOC_MODE_SPEED) != FOC_RESULT_OK ||
+        motor_SetSpeedReference(&tMotorB, FOC_SCALAR(-0.20f)) !=
+            FOC_RESULT_OK ||
+        motor_Start(&tMotorB, FOC_MODE_SPEED) != FOC_RESULT_OK) {
         return 1;
     }
-    if (tContextA.wInitCalls != 1U || tContextB.wInitCalls != 1U) {
+    motor_HighFrequencyStep(&tMotorA);
+    motor_HighFrequencyStep(&tMotorB);
+    if (!(tMotorA.tControl.tSpeedPi.qIntegrator !=
+                   tMotorB.tControl.tSpeedPi.qIntegrator &&
+                   tMotorA.tControl.tCurrentReference.qQ !=
+                       tMotorB.tControl.tCurrentReference.qQ)) {
         return 1;
     }
-    return tMotorA.pAdcContext == tMotorB.pAdcContext ? 1 : 0;
+    return 0;
 }
 
-static int test_motor_lifecycle_and_safe_start(void)
+static int test_foreground_poll_rate_and_backoff(void)
 {
     motor_t tMotor = {0};
-    motor_test_context_t tContext = {.bPositionValid = true};
-    motor_cfg_t tConfig = test_config(&tContext);
-    foc_core_command_t tCommand = {
-        .eMode = FOC_MODE_VOLTAGE,
-        .tVoltageReference = {FOC_ZERO, FOC_SCALAR(0.05f)},
-    };
+    motor_fake_t tFake = {.wCalibrationLimit = 1U,
+                          .bFeedbackValid = true,
+                          .bPollFails = false};
 
-    if (motor_Init(&tMotor, &tConfig) != FOC_RESULT_OK ||
-        tMotor.eLifecycle != MOTOR_STATE_INITIALIZING) {
+    s_lNowMs = 0;
+    test_init_to_idle(&tMotor, &tFake);
+    motor_BackgroundStep(&tMotor);
+    motor_BackgroundStep(&tMotor);
+    if (tFake.wPolls != 1U) {
         return 1;
     }
-    motor_HighFrequencyStep(&tMotor);
-    if (tContext.wCalibrationBeginCalls != 1U ||
-        tContext.wCalibrationStepCalls != 0U ||
-        tContext.wDutyCommitCalls != 0U ||
-        tMotor.eLifecycle != MOTOR_STATE_CALIBRATING) {
+    s_lNowMs = 1;
+    motor_BackgroundStep(&tMotor);
+    if (tFake.wPolls != 2U) {
         return 1;
     }
-    motor_HighFrequencyStep(&tMotor);
-    if (tContext.wCalibrationStepCalls != 1U ||
-        tMotor.eLifecycle != MOTOR_STATE_IDLE ||
-        tContext.bPwmEnabled) {
+    tFake.bPollFails = true;
+    s_lNowMs = 2;
+    motor_BackgroundStep(&tMotor);
+    s_lNowMs = 3;
+    motor_BackgroundStep(&tMotor);
+    if (tFake.wPolls != 3U ||
+        tMotor.tSchedule.hwConsecutivePollFails != 1U) {
         return 1;
     }
-    if (motor_Start(&tMotor, &tCommand) != FOC_RESULT_OK) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tMotor);
-    if (tMotor.eLifecycle != MOTOR_STATE_RUNNING ||
-        tContext.wDutyCommitCalls != 1U ||
-        tContext.wPwmEnableCalls != 1U ||
-        !tContext.bPwmEnabled) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tMotor);
-    if (tContext.wCurrentSampleCalls != 1U ||
-        tContext.wPositionReadCalls != 1U ||
-        tContext.wDutyCommitCalls != 2U) {
-        return 1;
-    }
-    motor_Stop(&tMotor);
-    return (tContext.wEmergencyStopCalls == 1U &&
-            tMotor.eLifecycle == MOTOR_STATE_IDLE &&
-            !tContext.bPwmEnabled) ? 0 : 1;
-}
-
-static int test_motor_speed_loop_mode_guard(void)
-{
-    motor_t tSpeedMotor = {0};
-    motor_t tCurrentMotor = {0};
-    motor_test_context_t tSpeedContext = {
-        .bPositionValid = true,
-        .qElectricalSpeed = FOC_SCALAR(80.0f / 7.0f),
-    };
-    motor_test_context_t tCurrentContext = {
-        .bPositionValid = true,
-    };
-    motor_cfg_t tSpeedConfig = test_config(&tSpeedContext);
-    motor_cfg_t tCurrentConfig = test_config(&tCurrentContext);
-    foc_core_command_t tSpeedCommand = {
-        .eMode = FOC_MODE_SPEED,
-        .qSpeedReference = FOC_SCALAR(100.0f),
-    };
-    foc_core_command_t tCurrentCommand = {
-        .eMode = FOC_MODE_CURRENT,
-        .tCurrentReference = {FOC_ZERO, FOC_SCALAR(0.05f)},
-    };
-    foc_scalar_t qCurrentBefore = FOC_ZERO;
-
-    if (motor_Init(&tSpeedMotor, &tSpeedConfig) != FOC_RESULT_OK ||
-        motor_Init(&tCurrentMotor, &tCurrentConfig) != FOC_RESULT_OK) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tSpeedMotor);
-    motor_HighFrequencyStep(&tSpeedMotor);
-    motor_HighFrequencyStep(&tCurrentMotor);
-    motor_HighFrequencyStep(&tCurrentMotor);
-    if (motor_Start(&tSpeedMotor, &tSpeedCommand) != FOC_RESULT_OK ||
-        motor_Start(&tCurrentMotor, &tCurrentCommand) != FOC_RESULT_OK) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tSpeedMotor);
-    motor_HighFrequencyStep(&tSpeedMotor);
-    motor_HighFrequencyStep(&tCurrentMotor);
-    motor_HighFrequencyStep(&tCurrentMotor);
-    qCurrentBefore = tCurrentMotor.tCommand.tCurrentReference.qQ;
-    motor_ClockStep(&tSpeedMotor);
-    motor_ClockStep(&tCurrentMotor);
-    if (tSpeedMotor.tCommand.tCurrentReference.qQ == FOC_ZERO) {
-        return 1;
-    }
-    return tCurrentMotor.tCommand.tCurrentReference.qQ == qCurrentBefore
+    s_lNowMs = 102;
+    motor_BackgroundStep(&tMotor);
+    return tFake.wPolls == 4U &&
+           tMotor.tSchedule.hwConsecutivePollFails == 2U
                ? 0 : 1;
-}
-
-static int test_speed_loop_respects_command_iq_limit(void)
-{
-    motor_t tPositiveMotor = {0};
-    motor_t tNegativeMotor = {0};
-    motor_test_context_t tPositiveContext = {
-        .bPositionValid = true,
-    };
-    motor_test_context_t tNegativeContext = {
-        .bPositionValid = true,
-    };
-    motor_cfg_t tPositiveConfig = test_config(&tPositiveContext);
-    motor_cfg_t tNegativeConfig = test_config(&tNegativeContext);
-    foc_core_command_t tPositiveCommand = {
-        .eMode = FOC_MODE_SPEED,
-        .tCurrentReference = {FOC_ZERO, FOC_SCALAR(0.03f)},
-        .qSpeedReference = FOC_SCALAR(100.0f),
-    };
-    foc_core_command_t tNegativeCommand = {
-        .eMode = FOC_MODE_SPEED,
-        .tCurrentReference = {FOC_ZERO, FOC_SCALAR(0.03f)},
-        .qSpeedReference = FOC_SCALAR(-100.0f),
-    };
-
-    if (motor_Init(&tPositiveMotor, &tPositiveConfig) != FOC_RESULT_OK ||
-        motor_Init(&tNegativeMotor, &tNegativeConfig) != FOC_RESULT_OK) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tPositiveMotor);
-    motor_HighFrequencyStep(&tPositiveMotor);
-    motor_HighFrequencyStep(&tNegativeMotor);
-    motor_HighFrequencyStep(&tNegativeMotor);
-    if (motor_Start(&tPositiveMotor, &tPositiveCommand) != FOC_RESULT_OK ||
-        motor_Start(&tNegativeMotor, &tNegativeCommand) != FOC_RESULT_OK) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tPositiveMotor);
-    motor_HighFrequencyStep(&tNegativeMotor);
-    motor_ClockStep(&tPositiveMotor);
-    motor_ClockStep(&tNegativeMotor);
-    return (tPositiveMotor.tCommand.tCurrentReference.qQ ==
-                FOC_SCALAR(0.03f) &&
-            tNegativeMotor.tCommand.tCurrentReference.qQ ==
-                FOC_SCALAR(-0.03f)) ? 0 : 1;
-}
-
-static int test_motor_api_owns_command_synchronization(void)
-{
-    motor_t tMotor = {0};
-    motor_test_context_t tContext = {.bPositionValid = true};
-    motor_cfg_t tConfig = test_config(&tContext);
-    foc_core_command_t tCommand = {
-        .eMode = FOC_MODE_SPEED,
-        .tCurrentReference = {FOC_ZERO, FOC_SCALAR(0.03f)},
-        .qSpeedReference = FOC_SCALAR(50.0f),
-    };
-    motor_feedback_t tFeedback = {0};
-    motor_status_t tStatus = {0};
-
-    if (motor_Init(&tMotor, &tConfig) != FOC_RESULT_OK) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tMotor);
-    motor_HighFrequencyStep(&tMotor);
-
-    test_reset_critical_counts();
-    if (motor_Start(&tMotor, &tCommand) != FOC_RESULT_OK ||
-        !test_critical_was_balanced()) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tMotor);
-
-    test_reset_critical_counts();
-    if (motor_SetSpeedReference(&tMotor, FOC_SCALAR(60.0f)) !=
-            FOC_RESULT_OK || !test_critical_was_balanced()) {
-        return 1;
-    }
-    test_reset_critical_counts();
-    if (motor_GetFeedback(&tMotor, &tFeedback) != FOC_RESULT_OK ||
-        !test_critical_was_balanced()) {
-        return 1;
-    }
-    test_reset_critical_counts();
-    if (motor_GetStatus(&tMotor, &tStatus) != FOC_RESULT_OK ||
-        !test_critical_was_balanced()) {
-        return 1;
-    }
-    test_reset_critical_counts();
-    motor_Stop(&tMotor);
-    return test_critical_was_balanced() ? 0 : 1;
-}
-
-static int test_motor_background_and_query_api(void)
-{
-    motor_t tMotor = {0};
-    motor_test_context_t tContext = {.bPositionValid = true};
-    motor_cfg_t tConfig = test_config(&tContext);
-    foc_core_command_t tCommand = {
-        .eMode = FOC_MODE_CURRENT,
-        .tCurrentReference = {FOC_SCALAR(0.10f), FOC_ZERO},
-    };
-    motor_feedback_t tFeedback = {0};
-    motor_status_t tStatus = {0};
-
-    if (motor_Init(&tMotor, &tConfig) != FOC_RESULT_OK) {
-        return 1;
-    }
-    motor_BackgroundStep(&tMotor);
-    if (tContext.wSlowUpdateCalls != 1U) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tMotor);
-    motor_HighFrequencyStep(&tMotor);
-    if (motor_Start(&tMotor, &tCommand) != FOC_RESULT_OK) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tMotor);
-    motor_HighFrequencyStep(&tMotor);
-    if (motor_SetCurrentReference(&tMotor, FOC_SCALAR(0.10f),
-                                  FOC_SCALAR(0.02f)) != FOC_RESULT_OK ||
-        motor_SetSpeedReference(&tMotor, FOC_SCALAR(10.0f)) !=
-            FOC_RESULT_INVALID_ARGUMENT ||
-        motor_CaptureElectricalZero(&tMotor) != FOC_RESULT_DISABLED ||
-        motor_GetFeedback(&tMotor, &tFeedback) != FOC_RESULT_OK ||
-        motor_GetStatus(&tMotor, &tStatus) != FOC_RESULT_OK) {
-        return 1;
-    }
-    return tStatus.eLifecycle == MOTOR_STATE_RUNNING &&
-                   tFeedback.tPosition.bValid
-               ? 0
-               : 1;
-}
-
-static int test_position_cal_requires_capture_provider(void)
-{
-    motor_t tMotor = {0};
-    motor_test_context_t tContext = {.bPositionValid = true};
-    motor_cfg_t tConfig = test_config(&tContext);
-
-    if (motor_Init(&tMotor, &tConfig) != FOC_RESULT_OK) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tMotor);
-    motor_HighFrequencyStep(&tMotor);
-    if (tMotor.eLifecycle != MOTOR_STATE_IDLE) {
-        return 1;
-    }
-    if (motor_RequestPositionCalibration(&tMotor, FOC_SCALAR(0.10f))
-            != FOC_RESULT_DISABLED) {
-        return 1;
-    }
-    return (tMotor.eLifecycle == MOTOR_STATE_IDLE &&
-            tContext.wEmergencyStopCalls == 0U &&
-            !tContext.bPwmEnabled) ? 0 : 1;
-}
-
-static int test_position_cal_rejects_bad_state_and_args(void)
-{
-    motor_t tMotor = {0};
-    motor_test_context_t tContext = {.bPositionValid = true};
-    motor_cfg_t tConfig = test_cal_config(&tContext);
-    foc_core_command_t tCommand = {
-        .eMode = FOC_MODE_CURRENT,
-        .tCurrentReference = {FOC_ZERO, FOC_SCALAR(0.05f)},
-    };
-
-    if (motor_Init(&tMotor, &tConfig) != FOC_RESULT_OK) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tMotor);
-    motor_HighFrequencyStep(&tMotor);
-    if (motor_RequestPositionCalibration(&tMotor, FOC_ZERO) !=
-            FOC_RESULT_INVALID_ARGUMENT ||
-        motor_RequestPositionCalibration(&tMotor, FOC_SCALAR(1.5f)) !=
-            FOC_RESULT_INVALID_ARGUMENT) {
-        return 1;
-    }
-    if (motor_Start(&tMotor, &tCommand) != FOC_RESULT_OK) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tMotor);
-    motor_HighFrequencyStep(&tMotor);
-    if (tMotor.eLifecycle != MOTOR_STATE_RUNNING ||
-        motor_RequestPositionCalibration(&tMotor, FOC_SCALAR(0.10f)) !=
-            FOC_RESULT_BUSY) {
-        return 1;
-    }
-    motor_Stop(&tMotor);
-    return tMotor.eLifecycle == MOTOR_STATE_IDLE ? 0 : 1;
-}
-
-static int test_position_cal_align_then_capture(void)
-{
-    motor_t tMotor = {0};
-    motor_test_context_t tContext = {.bPositionValid = true};
-    motor_cfg_t tConfig = test_cal_config(&tContext);
-    uint32_t wIdx = 0U;
-
-    if (motor_Init(&tMotor, &tConfig) != FOC_RESULT_OK) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tMotor);
-    motor_HighFrequencyStep(&tMotor);
-    if (motor_RequestPositionCalibration(&tMotor, FOC_SCALAR(0.10f))
-            != FOC_RESULT_OK) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tMotor);
-    if (tMotor.eLifecycle != MOTOR_STATE_POSITION_CAL ||
-        !tContext.bPwmEnabled ||
-        tContext.wPwmEnableCalls != 1U ||
-        tMotor.tCommand.eMode != FOC_MODE_CURRENT ||
-        tMotor.tCommand.tCurrentReference.qD != FOC_SCALAR(0.10f) ||
-        tMotor.tCommand.tCurrentReference.qQ != FOC_ZERO) {
-        return 1;
-    }
-    for (wIdx = 0U; wIdx < 4U; wIdx++) {
-        motor_HighFrequencyStep(&tMotor);
-    }
-    motor_BackgroundStep(&tMotor);
-    if (tContext.wCaptureCalls != 0U ||
-        tMotor.eLifecycle != MOTOR_STATE_POSITION_CAL) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tMotor);
-    motor_BackgroundStep(&tMotor);
-    if (tContext.wCaptureCalls != 1U ||
-        !tContext.bZeroCaptured ||
-        tMotor.eLifecycle != MOTOR_STATE_IDLE ||
-        tContext.bPwmEnabled ||
-        tContext.wEmergencyStopCalls != 1U ||
-        tMotor.wFaults != 0U) {
-        return 1;
-    }
-    motor_BackgroundStep(&tMotor);
-    return tContext.wCaptureCalls == 1U ? 0 : 1;
-}
-
-static int test_position_cal_adc_before_align(void)
-{
-    motor_t tMotor = {0};
-    motor_test_context_t tContext = {.bPositionValid = true};
-    motor_cfg_t tConfig = test_cal_config(&tContext);
-
-    if (motor_Init(&tMotor, &tConfig) != FOC_RESULT_OK ||
-        tMotor.eLifecycle != MOTOR_STATE_INITIALIZING) {
-        return 1;
-    }
-    if (motor_RequestPositionCalibration(&tMotor, FOC_SCALAR(0.10f))
-            != FOC_RESULT_OK) {
-        return 1;
-    }
-    if (tMotor.eLifecycle != MOTOR_STATE_CALIBRATING ||
-        tContext.wCalibrationBeginCalls != 1U) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tMotor);
-    return (tMotor.eLifecycle == MOTOR_STATE_POSITION_CAL &&
-            tContext.bPwmEnabled &&
-            tContext.wCalibrationStepCalls == 1U) ? 0 : 1;
-}
-
-static int test_position_cal_invalid_position_fault(void)
-{
-    motor_t tMotor = {0};
-    motor_test_context_t tContext = {.bPositionValid = false};
-    motor_cfg_t tConfig = test_cal_config(&tContext);
-    uint32_t wIdx = 0U;
-
-    if (motor_Init(&tMotor, &tConfig) != FOC_RESULT_OK) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tMotor);
-    motor_HighFrequencyStep(&tMotor);
-    if (motor_RequestPositionCalibration(&tMotor, FOC_SCALAR(0.10f))
-            != FOC_RESULT_OK) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tMotor);
-    for (wIdx = 0U; wIdx < 5U; wIdx++) {
-        motor_HighFrequencyStep(&tMotor);
-    }
-    motor_BackgroundStep(&tMotor);
-    if (tMotor.eLifecycle != MOTOR_STATE_FAULT ||
-        (tMotor.wFaults & MOTOR_FAULT_POSITION_CAL) == 0U ||
-        tContext.bPwmEnabled ||
-        tContext.wEmergencyStopCalls == 0U ||
-        tContext.bZeroCaptured) {
-        return 1;
-    }
-    if (motor_ClearFault(&tMotor) != FOC_RESULT_OK ||
-        tMotor.eLifecycle != MOTOR_STATE_IDLE ||
-        tMotor.wFaults != 0U) {
-        return 1;
-    }
-    tContext.bPositionValid = true;
-    if (motor_RequestPositionCalibration(&tMotor, FOC_SCALAR(0.10f))
-            != FOC_RESULT_OK) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tMotor);
-    for (wIdx = 0U; wIdx < 5U; wIdx++) {
-        motor_HighFrequencyStep(&tMotor);
-    }
-    motor_BackgroundStep(&tMotor);
-    return (tContext.bZeroCaptured &&
-            tMotor.eLifecycle == MOTOR_STATE_IDLE &&
-            tMotor.wFaults == 0U) ? 0 : 1;
-}
-
-static int test_position_cal_adc_timeout_fault(void)
-{
-    motor_t tMotor = {0};
-    motor_test_context_t tContext = {
-        .bPositionValid = true,
-        .bAdcCalibrationBusy = true,
-    };
-    motor_cfg_t tConfig = test_cal_config(&tContext);
-    uint32_t wIdx = 0U;
-
-    if (motor_Init(&tMotor, &tConfig) != FOC_RESULT_OK) {
-        return 1;
-    }
-    if (motor_RequestPositionCalibration(&tMotor, FOC_SCALAR(0.10f))
-            != FOC_RESULT_OK ||
-        tMotor.eLifecycle != MOTOR_STATE_CALIBRATING) {
-        return 1;
-    }
-    for (wIdx = 0U; wIdx <= 2000U; wIdx++) {
-        motor_HighFrequencyStep(&tMotor);
-    }
-    if (tMotor.eLifecycle != MOTOR_STATE_FAULT ||
-        (tMotor.wFaults & MOTOR_FAULT_CALIBRATION_TIMEOUT) == 0U ||
-        tContext.wPwmEnableCalls != 0U) {
-        return 1;
-    }
-    return motor_ClearFault(&tMotor) == FOC_RESULT_OK &&
-                   tMotor.eLifecycle == MOTOR_STATE_IDLE
-               ? 0
-               : 1;
-}
-
-static int test_position_cal_stop_cancels(void)
-{
-    motor_t tMotor = {0};
-    motor_test_context_t tContext = {.bPositionValid = true};
-    motor_cfg_t tConfig = test_cal_config(&tContext);
-
-    if (motor_Init(&tMotor, &tConfig) != FOC_RESULT_OK) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tMotor);
-    motor_HighFrequencyStep(&tMotor);
-    if (motor_RequestPositionCalibration(&tMotor, FOC_SCALAR(0.10f))
-            != FOC_RESULT_OK) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tMotor);
-    if (tMotor.eLifecycle != MOTOR_STATE_POSITION_CAL) {
-        return 1;
-    }
-    motor_Stop(&tMotor);
-    motor_BackgroundStep(&tMotor);
-    return (tMotor.eLifecycle == MOTOR_STATE_IDLE &&
-            !tContext.bPwmEnabled &&
-            tContext.wEmergencyStopCalls == 1U &&
-            tContext.wCaptureCalls == 0U &&
-            !tContext.bZeroCaptured) ? 0 : 1;
-}
-
-static int test_motor_phase_snapshot(void)
-{
-    motor_t tMotor = {0};
-    motor_test_context_t tContext = {
-        .bPositionValid = true,
-        .qIu = FOC_SCALAR(0.050f),
-        .qIv = FOC_SCALAR(-0.030f),
-        .qIw = FOC_SCALAR(0.020f),
-    };
-    motor_cfg_t tConfig = test_config(&tContext);
-    foc_core_command_t tCommand = {
-        .eMode = FOC_MODE_CURRENT,
-        .tCurrentReference = {FOC_ZERO, FOC_SCALAR(0.05f)},
-    };
-
-    if (motor_Init(&tMotor, &tConfig) != FOC_RESULT_OK) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tMotor);
-    motor_HighFrequencyStep(&tMotor);
-    if (motor_Start(&tMotor, &tCommand) != FOC_RESULT_OK) {
-        return 1;
-    }
-    motor_HighFrequencyStep(&tMotor);
-    motor_HighFrequencyStep(&tMotor);
-    return (tMotor.qIuLatest == FOC_SCALAR(0.050f) &&
-            tMotor.qIvLatest == FOC_SCALAR(-0.030f) &&
-            tMotor.qIwLatest == FOC_SCALAR(0.020f)) ? 0 : 1;
 }
 
 int main(void)
 {
     int nFailures = 0;
-    int nSub = test_rejects_invalid_configuration();
+    int nResult = 0;
 
-    printf("  invalid_config: %s\n", nSub == 0 ? "PASS" : "FAIL");
-    nFailures += nSub;
-    nSub = test_binds_two_contexts();
-    printf("  two_contexts: %s\n", nSub == 0 ? "PASS" : "FAIL");
-    nFailures += nSub;
-    nSub = test_motor_lifecycle_and_safe_start();
-    printf("  lifecycle_safe_start: %s\n",
-           nSub == 0 ? "PASS" : "FAIL");
-    nFailures += nSub;
-    nSub = test_motor_speed_loop_mode_guard();
-    printf("  speed_loop_mode_guard: %s\n",
-           nSub == 0 ? "PASS" : "FAIL");
-    nFailures += nSub;
-    nSub = test_speed_loop_respects_command_iq_limit();
-    printf("  speed_loop_iq_limit: %s\n",
-           nSub == 0 ? "PASS" : "FAIL");
-    nFailures += nSub;
-    nSub = test_motor_api_owns_command_synchronization();
-    printf("  motor_api_sync: %s\n",
-           nSub == 0 ? "PASS" : "FAIL");
-    nFailures += nSub;
-    nSub = test_motor_background_and_query_api();
-    printf("  background_query_api: %s\n",
-           nSub == 0 ? "PASS" : "FAIL");
-    nFailures += nSub;
-    nSub = test_position_cal_requires_capture_provider();
-    printf("  position_cal_no_capture: %s\n",
-           nSub == 0 ? "PASS" : "FAIL");
-    nFailures += nSub;
-    nSub = test_position_cal_rejects_bad_state_and_args();
-    printf("  position_cal_state_gating: %s\n",
-           nSub == 0 ? "PASS" : "FAIL");
-    nFailures += nSub;
-    nSub = test_position_cal_align_then_capture();
-    printf("  position_cal_align_capture: %s\n",
-           nSub == 0 ? "PASS" : "FAIL");
-    nFailures += nSub;
-    nSub = test_position_cal_adc_before_align();
-    printf("  position_cal_adc_first: %s\n",
-           nSub == 0 ? "PASS" : "FAIL");
-    nFailures += nSub;
-    nSub = test_position_cal_invalid_position_fault();
-    printf("  position_cal_invalid_fault: %s\n",
-           nSub == 0 ? "PASS" : "FAIL");
-    nFailures += nSub;
-    nSub = test_position_cal_adc_timeout_fault();
-    printf("  position_cal_adc_timeout: %s\n",
-           nSub == 0 ? "PASS" : "FAIL");
-    nFailures += nSub;
-    nSub = test_position_cal_stop_cancels();
-    printf("  position_cal_stop_cancel: %s\n",
-           nSub == 0 ? "PASS" : "FAIL");
-    nFailures += nSub;
-    nSub = test_motor_phase_snapshot();
-    printf("  phase_snapshot: %s\n",
-           nSub == 0 ? "PASS" : "FAIL");
-    nFailures += nSub;
-    printf("motor contract: %s (%d failures)\n",
+    nResult = test_adc_cal_never_enables_pwm();
+    printf("  adc_cal_safe: %s\n", nResult == 0 ? "PASS" : "FAIL");
+    nFailures += nResult;
+    nResult = test_start_during_adc_cal_is_busy();
+    printf("  adc_start_guard: %s\n", nResult == 0 ? "PASS" : "FAIL");
+    nFailures += nResult;
+    nResult = test_typed_references_and_start();
+    printf("  typed_start: %s\n", nResult == 0 ? "PASS" : "FAIL");
+    nFailures += nResult;
+    nResult = test_speed_pi_runs_once_per_twenty_ticks();
+    printf("  speed_divider: %s\n", nResult == 0 ? "PASS" : "FAIL");
+    nFailures += nResult;
+    nResult = test_alignment_requires_adc_and_exits_safe();
+    printf("  align_safe: %s\n", nResult == 0 ? "PASS" : "FAIL");
+    nFailures += nResult;
+    nResult = test_two_instances_have_independent_speed_pi();
+    printf("  two_instances: %s\n", nResult == 0 ? "PASS" : "FAIL");
+    nFailures += nResult;
+    nResult = test_foreground_poll_rate_and_backoff();
+    printf("  foreground_poll: %s\n",
+           nResult == 0 ? "PASS" : "FAIL");
+    nFailures += nResult;
+    printf("motor framework: %s (%d failures)\n",
            nFailures == 0 ? "PASS" : "FAIL", nFailures);
     return nFailures;
 }
