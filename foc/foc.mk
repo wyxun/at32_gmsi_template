@@ -15,7 +15,6 @@ FOC_INCLUDES = -Ifoc \
                -Ifoc/math -Ifoc/hal -Ifoc/motor \
                -Ifoc/middleware -Ifoc/control \
                -Ifoc/modulation -Ifoc/observer \
-               -Ifoc/optimization -Ifoc/experimental \
                -Ifoc/app
 
 FOC_SOURCES = foc/math/foc_numeric.c \

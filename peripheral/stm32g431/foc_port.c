@@ -1,37 +1,36 @@
 /****************************************************************************
  * @file    foc_port.c
- * @brief   STM32G431 FOC port: default ops-table implementations
+ * @brief   STM32G431 direct ADC and PWM implementation for FOC.
  * @author  Codex
- * @date    2026-08-29
- *
- * 这是 MDI 挂载层：foc 内部只通过 ops 表访问硬件，具体 mdi/vendor
- * 挂钩只发生在本文件。换芯片 = 换本文件提供的 ops 表。
- ************************************************************************** */
+ * @date    2026-09-11
+ ****************************************************************************/
 
 #include "foc_port.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 
-#include "userconfig.h"
 #include "haladc.h"
 #include "haltim1.h"
-#include "mdi_hw.h"
 #include "mdi/mdi.h"
+#include "mdi_hw.h"
 #include "port_mdi.h"
 
-#if defined(MDI_HW_HAS_I2C_ENCODER)
 #include "as5600.h"
-#endif
 
-#define FOC_PORT_ADC_SAMPLES          512U
-#define FOC_PORT_PWM_PERIOD           4250U
-#define FOC_PORT_CURRENT_COUNTS_PU   1390U
+#define FOC_PORT_ADC_SAMPLES        512U
+#define FOC_PORT_PWM_PERIOD         4250U
+#define FOC_PORT_CURRENT_COUNTS_PU  1390U
 #define FOC_PORT_OFFSET_MIN         20000U
 #define FOC_PORT_OFFSET_MAX         60000U
 
-/* ===== ADC：三相电流采样 + 零偏校准 ===== */
-
-/** @brief Read the injected ADC results for all three phases. */
+/**
+ * @brief Read the three injected ADC channels with the board mapping.
+ * @param pwRawU U-phase raw output.
+ * @param pwRawV V-phase raw output.
+ * @param pwRawW W-phase raw output.
+ * @return None.
+ */
 static void port_read_raw(uint32_t *pwRawU,
                           uint32_t *pwRawV,
                           uint32_t *pwRawW)
@@ -41,10 +40,14 @@ static void port_read_raw(uint32_t *pwRawU,
     *pwRawW = haladc_GetInjected(HALADC_ADC2, 0U);
 }
 
-/** @brief Convert one ADC offset delta into normalized current. */
+/**
+ * @brief Convert one ADC offset delta to a normalized current.
+ * @param nDelta Offset minus raw ADC counts.
+ * @return Normalized phase current.
+ */
 static foc_scalar_t port_normalize_current(int32_t nDelta)
 {
-    int32_t nBase = (int32_t)FOC_PORT_CURRENT_COUNTS_PU;
+    const int32_t nBase = (int32_t)FOC_PORT_CURRENT_COUNTS_PU;
 
     nDelta = nDelta > nBase ? nBase : nDelta;
     nDelta = nDelta < -nBase ? -nBase : nDelta;
@@ -55,7 +58,11 @@ static foc_scalar_t port_normalize_current(int32_t nDelta)
 #endif
 }
 
-/** @brief Convert a normalized duty value to the TIM1 compare range. */
+/**
+ * @brief Convert a normalized duty to a TIM1 compare value.
+ * @param qDuty Normalized duty.
+ * @return Timer compare value.
+ */
 static uint32_t port_duty_to_counts(foc_scalar_t qDuty)
 {
     qDuty = foc_sat(qDuty, FOC_ZERO, FOC_ONE);
@@ -67,7 +74,11 @@ static uint32_t port_duty_to_counts(foc_scalar_t qDuty)
 #endif
 }
 
-/** @brief Check the ADC offset range required by this power stage. */
+/**
+ * @brief Check the ADC offset range required by the power stage.
+ * @param ptCalibration Calibration state.
+ * @return true when all three offsets are valid.
+ */
 static bool port_offsets_are_valid(const foc_adc_calib_t *ptCalibration)
 {
     return ptCalibration->wOffsetU >= FOC_PORT_OFFSET_MIN &&
@@ -78,7 +89,11 @@ static bool port_offsets_are_valid(const foc_adc_calib_t *ptCalibration)
            ptCalibration->wOffsetW <= FOC_PORT_OFFSET_MAX;
 }
 
-/** @brief Finalize and validate the accumulated ADC offsets. */
+/**
+ * @brief Finish offset averaging and validate the result.
+ * @param ptCalibration Calibration state.
+ * @return true when the averaged offsets are safe.
+ */
 static bool port_store_calibration(foc_adc_calib_t *ptCalibration)
 {
     ptCalibration->wOffsetU = (uint32_t)(ptCalibration->ullSumU /
@@ -91,10 +106,8 @@ static bool port_store_calibration(foc_adc_calib_t *ptCalibration)
     return ptCalibration->bIsCalibrated;
 }
 
-static void port_calibration_begin(void *pContext,
-                                   foc_adc_calib_t *ptCalibration)
+void foc_adc_CalibBegin(foc_adc_calib_t *ptCalibration)
 {
-    (void)pContext;
     if (ptCalibration == NULL) {
         return;
     }
@@ -109,15 +122,13 @@ static void port_calibration_begin(void *pContext,
     haltim1_StartAdcTrigger();
 }
 
-static foc_calibration_state_e port_calibration_step(
-    void *pContext,
+foc_calibration_state_e foc_adc_CalibStep(
     foc_adc_calib_t *ptCalibration)
 {
     uint32_t wRawU = 0U;
     uint32_t wRawV = 0U;
     uint32_t wRawW = 0U;
 
-    (void)pContext;
     if (ptCalibration == NULL) {
         return FOC_CALIBRATION_FAILED;
     }
@@ -125,9 +136,9 @@ static foc_calibration_state_e port_calibration_step(
         return FOC_CALIBRATION_COMPLETE;
     }
     port_read_raw(&wRawU, &wRawV, &wRawW);
-    ptCalibration->ullSumU += wRawU;
-    ptCalibration->ullSumV += wRawV;
-    ptCalibration->ullSumW += wRawW;
+    ptCalibration->ullSumU += (uint64_t)wRawU;
+    ptCalibration->ullSumV += (uint64_t)wRawV;
+    ptCalibration->ullSumW += (uint64_t)wRawW;
     ptCalibration->hwSampleCount++;
     if (ptCalibration->hwSampleCount < FOC_PORT_ADC_SAMPLES) {
         return FOC_CALIBRATION_BUSY;
@@ -136,38 +147,31 @@ static foc_calibration_state_e port_calibration_step(
         ? FOC_CALIBRATION_COMPLETE : FOC_CALIBRATION_FAILED;
 }
 
-static foc_result_t port_current_sample(
-    void *pContext,
-    const foc_adc_calib_t *ptCalibration,
-    foc_core_input_t *ptInput)
+foc_result_t foc_adc_Sample(const foc_adc_calib_t *ptCalibration,
+                            foc_current_abc_t *ptCurrent)
 {
-    uint32_t wRawU;
-    uint32_t wRawV;
-    uint32_t wRawW;
+    uint32_t wRawU = 0U;
+    uint32_t wRawV = 0U;
+    uint32_t wRawW = 0U;
 
-    (void)pContext;
-    if (ptCalibration == NULL || ptInput == NULL) {
+    if (ptCalibration == NULL || ptCurrent == NULL) {
         return FOC_RESULT_NULL;
     }
     if (!ptCalibration->bIsCalibrated) {
         return FOC_RESULT_SAFETY;
     }
     port_read_raw(&wRawU, &wRawV, &wRawW);
-    ptInput->qIu = port_normalize_current(
+    ptCurrent->qU = port_normalize_current(
         (int32_t)ptCalibration->wOffsetU - (int32_t)wRawU);
-    ptInput->qIv = port_normalize_current(
+    ptCurrent->qV = port_normalize_current(
         (int32_t)ptCalibration->wOffsetV - (int32_t)wRawV);
-    ptInput->qIw = port_normalize_current(
+    ptCurrent->qW = port_normalize_current(
         (int32_t)ptCalibration->wOffsetW - (int32_t)wRawW);
     return FOC_RESULT_OK;
 }
 
-/* ===== PWM：duty 提交 / 使能 / 急停 ===== */
-
-static foc_result_t port_duty_commit(void *pContext,
-                                     const foc_duty_abc_t *ptDuty)
+foc_result_t foc_pwm_SetDuty(const foc_duty_abc_t *ptDuty)
 {
-    (void)pContext;
     if (ptDuty == NULL) {
         return FOC_RESULT_NULL;
     }
@@ -178,42 +182,41 @@ static foc_result_t port_duty_commit(void *pContext,
         ? FOC_RESULT_OK : FOC_RESULT_INVALID_ARGUMENT;
 }
 
-static foc_result_t port_pwm_enable(void *pContext, bool bEnable)
+foc_result_t foc_pwm_Enable(void)
 {
-    (void)pContext;
     if (HW.ptMotorU == NULL) {
         return FOC_RESULT_INVALID_ARGUMENT;
     }
-    return MDI_Enable(HW.ptMotorU, bEnable) == 0
+    return MDI_Enable(HW.ptMotorU, true) == 0
         ? FOC_RESULT_OK : FOC_RESULT_INVALID_ARGUMENT;
 }
 
-static void port_emergency_stop(void *pContext)
+void foc_pwm_Stop(void)
 {
-    (void)pContext;
     if (HW.ptMotorU != NULL) {
-        (void)MDI_Enable(HW.ptMotorU, false);
+        if (MDI_Enable(HW.ptMotorU, false) != 0) {
+            /* The hardware path is already commanded to its safe state. */
+        }
     }
 }
 
-/* ===== 默认 ops 表 ===== */
-
-const foc_pwm_ops_t g_tFocPwmOps = {
-    .fnDutyCommit    = port_duty_commit,
-    .fnPwmEnable     = port_pwm_enable,
-    .fnEmergencyStop = port_emergency_stop,
-};
-
-const foc_adc_ops_t g_tFocAdcOps = {
-    .fnCalibrationBegin = port_calibration_begin,
-    .fnCalibrationStep  = port_calibration_step,
-    .fnCurrentSample    = port_current_sample,
-};
-
-#if defined(MDI_HW_HAS_I2C_ENCODER)
 as5600_t g_tFocAs5600;
 
-int32_t foc_port_As5600Init(void *pContext)
+/**
+ * @brief Return the board-owned raw position context.
+ * @return Opaque position-driver context.
+ */
+void *foc_port_PositionContext(void)
+{
+    return &g_tFocAs5600;
+}
+
+/**
+ * @brief Initialize the board's raw mechanical position source.
+ * @param pContext Opaque position-driver context.
+ * @return Zero on success, negative on missing hardware.
+ */
+int32_t foc_port_PositionInit(void *pContext)
 {
     as5600_t *ptAs5600 = (as5600_t *)pContext;
 
@@ -223,13 +226,18 @@ int32_t foc_port_As5600Init(void *pContext)
     return as5600_Init(ptAs5600, HW.ptI2c1);
 }
 
-int32_t foc_port_As5600Read(void *pContext,
-                            uint16_t *phwRawAngle)
+/**
+ * @brief Read one raw mechanical angle from the board source.
+ * @param pContext Opaque position-driver context.
+ * @param phwRawAngle Output 12-bit raw angle.
+ * @return Zero on success, negative on transfer failure.
+ */
+int32_t foc_port_PositionRead(void *pContext,
+                              uint16_t *phwRawAngle)
 {
     if (pContext == NULL || phwRawAngle == NULL) {
         return -1;
     }
-    return as5600_ReadMechanicalAngle((as5600_t *)pContext, phwRawAngle);
+    return as5600_ReadMechanicalAngle((as5600_t *)pContext,
+                                      phwRawAngle);
 }
-
-#endif

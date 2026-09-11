@@ -1,21 +1,29 @@
 /****************************************************************************
  * @file    foc_port.c
- * @brief   AT32F413 FOC port: ADC and PWM ops-table implementations.
+ * @brief   AT32F413 direct ADC and PWM implementation for FOC.
+ * @author  Codex
+ * @date    2026-09-11
  ****************************************************************************/
 
 #include "foc_port.h"
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-#include "foc_config.h"
 #include "haladc.h"
 #include "halpwm.h"
-#include "port_mdi.h"
 
-#define FOC_PORT_ADC_SAMPLES 512U
-#define FOC_PORT_CURRENT_BASE 2048U
+#define FOC_PORT_ADC_SAMPLES   512U
+#define FOC_PORT_CURRENT_BASE  2048U
 
+/**
+ * @brief Read the three preempt ADC channels.
+ * @param pwRawU U-phase raw output.
+ * @param pwRawV V-phase raw output.
+ * @param pwRawW W-phase raw output.
+ * @return None.
+ */
 static void port_read_raw(uint32_t *pwRawU,
                           uint32_t *pwRawV,
                           uint32_t *pwRawW)
@@ -30,6 +38,11 @@ static void port_read_raw(uint32_t *pwRawU,
     *pwRawW = (uint32_t)hwRawW;
 }
 
+/**
+ * @brief Check the AT32 ADC offset range.
+ * @param ptCalibration Calibration state.
+ * @return true when all offsets are inside the ADC range.
+ */
 static bool port_offsets_are_valid(const foc_adc_calib_t *ptCalibration)
 {
     return ptCalibration->wOffsetU > 0U &&
@@ -40,9 +53,14 @@ static bool port_offsets_are_valid(const foc_adc_calib_t *ptCalibration)
            ptCalibration->wOffsetW < 4096U;
 }
 
+/**
+ * @brief Convert one ADC delta to a normalized current.
+ * @param nDelta Raw ADC delta.
+ * @return Normalized phase current.
+ */
 static foc_scalar_t port_normalize_current(int32_t nDelta)
 {
-    int32_t nBase = (int32_t)FOC_PORT_CURRENT_BASE;
+    const int32_t nBase = (int32_t)FOC_PORT_CURRENT_BASE;
 
     nDelta = nDelta > nBase ? nBase : nDelta;
     nDelta = nDelta < -nBase ? -nBase : nDelta;
@@ -53,6 +71,11 @@ static foc_scalar_t port_normalize_current(int32_t nDelta)
 #endif
 }
 
+/**
+ * @brief Convert a normalized duty to a timer compare value.
+ * @param qDuty Normalized duty.
+ * @return Timer compare value.
+ */
 static uint32_t port_duty_to_counts(foc_scalar_t qDuty)
 {
     qDuty = foc_sat(qDuty, FOC_ZERO, FOC_ONE);
@@ -63,10 +86,8 @@ static uint32_t port_duty_to_counts(foc_scalar_t qDuty)
 #endif
 }
 
-static void port_calibration_begin(void *pContext,
-                                    foc_adc_calib_t *ptCalibration)
+void foc_adc_CalibBegin(foc_adc_calib_t *ptCalibration)
 {
-    (void)pContext;
     if (ptCalibration == NULL) {
         return;
     }
@@ -80,15 +101,13 @@ static void port_calibration_begin(void *pContext,
     ptCalibration->bIsCalibrated = false;
 }
 
-static foc_calibration_state_e port_calibration_step(
-    void *pContext,
+foc_calibration_state_e foc_adc_CalibStep(
     foc_adc_calib_t *ptCalibration)
 {
     uint32_t wRawU = 0U;
     uint32_t wRawV = 0U;
     uint32_t wRawW = 0U;
 
-    (void)pContext;
     if (ptCalibration == NULL) {
         return FOC_CALIBRATION_FAILED;
     }
@@ -96,9 +115,9 @@ static foc_calibration_state_e port_calibration_step(
         return FOC_CALIBRATION_COMPLETE;
     }
     port_read_raw(&wRawU, &wRawV, &wRawW);
-    ptCalibration->ullSumU += wRawU;
-    ptCalibration->ullSumV += wRawV;
-    ptCalibration->ullSumW += wRawW;
+    ptCalibration->ullSumU += (uint64_t)wRawU;
+    ptCalibration->ullSumV += (uint64_t)wRawV;
+    ptCalibration->ullSumW += (uint64_t)wRawW;
     ptCalibration->hwSampleCount++;
     if (ptCalibration->hwSampleCount < FOC_PORT_ADC_SAMPLES) {
         return FOC_CALIBRATION_BUSY;
@@ -114,36 +133,31 @@ static foc_calibration_state_e port_calibration_step(
         ? FOC_CALIBRATION_COMPLETE : FOC_CALIBRATION_FAILED;
 }
 
-static foc_result_t port_current_sample(
-    void *pContext,
-    const foc_adc_calib_t *ptCalibration,
-    foc_core_input_t *ptInput)
+foc_result_t foc_adc_Sample(const foc_adc_calib_t *ptCalibration,
+                            foc_current_abc_t *ptCurrent)
 {
     uint32_t wRawU = 0U;
     uint32_t wRawV = 0U;
     uint32_t wRawW = 0U;
 
-    (void)pContext;
-    if (ptCalibration == NULL || ptInput == NULL) {
+    if (ptCalibration == NULL || ptCurrent == NULL) {
         return FOC_RESULT_NULL;
     }
     if (!ptCalibration->bIsCalibrated) {
         return FOC_RESULT_SAFETY;
     }
     port_read_raw(&wRawU, &wRawV, &wRawW);
-    ptInput->qIu = port_normalize_current(
+    ptCurrent->qU = port_normalize_current(
         (int32_t)wRawU - (int32_t)ptCalibration->wOffsetU);
-    ptInput->qIv = port_normalize_current(
+    ptCurrent->qV = port_normalize_current(
         (int32_t)wRawV - (int32_t)ptCalibration->wOffsetV);
-    ptInput->qIw = port_normalize_current(
+    ptCurrent->qW = port_normalize_current(
         (int32_t)wRawW - (int32_t)ptCalibration->wOffsetW);
     return FOC_RESULT_OK;
 }
 
-static foc_result_t port_duty_commit(void *pContext,
-                                     const foc_duty_abc_t *ptDuty)
+foc_result_t foc_pwm_SetDuty(const foc_duty_abc_t *ptDuty)
 {
-    (void)pContext;
     if (ptDuty == NULL) {
         return FOC_RESULT_NULL;
     }
@@ -153,33 +167,13 @@ static foc_result_t port_duty_commit(void *pContext,
     return FOC_RESULT_OK;
 }
 
-static foc_result_t port_pwm_enable(void *pContext, bool bEnable)
+foc_result_t foc_pwm_Enable(void)
 {
-    (void)pContext;
-    if (bEnable) {
-        halpwm_Start();
-    } else {
-        halpwm_Stop();
-    }
+    halpwm_Start();
     return FOC_RESULT_OK;
 }
 
-static void port_emergency_stop(void *pContext)
+void foc_pwm_Stop(void)
 {
-    (void)pContext;
     halpwm_Stop();
 }
-
-const foc_pwm_ops_t g_tFocPwmOps = {
-    .fnDutyCommit = port_duty_commit,
-    .fnPwmEnable = port_pwm_enable,
-    .fnEmergencyStop = port_emergency_stop,
-};
-
-const foc_adc_ops_t g_tFocAdcOps = {
-    .fnCalibrationBegin = port_calibration_begin,
-    .fnCalibrationStep = port_calibration_step,
-    .fnCurrentSample = port_current_sample,
-};
-
-/* This board has no registered position sensor. Runtime FOC is disabled. */
