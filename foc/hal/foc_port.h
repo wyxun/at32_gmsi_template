@@ -12,8 +12,7 @@
  * 函数指针间接层，-flto 下内联为直接调用，成本趋零；多芯片/多传感
  * 器适配只更换 ops 表，foc 内部零改动。
  *
- * 位置/速度反馈由 motor_position.h 单独抽象；本文件只暴露板级默认
- * PositionPort 绑定配置。
+ * 位置结果由 foc_position.h 统一表达；位置后端由板级配置绑定。
  **************************************************************************/
 
 #ifndef FOC_PORT_H
@@ -23,23 +22,6 @@
 #include <stdint.h>
 
 #include "foc_types.h"
-#include "foc_encoder.h"
-#include "motor_position.h"
-
-#if defined(__has_include)
-#if __has_include("foc_port_config.h")
-#include "foc_port_config.h"
-#endif
-#endif
-
-#ifndef FOC_PORT_HAS_POSITION
-#define FOC_PORT_HAS_POSITION 1
-#endif
-
-#ifndef FOC_PORT_DEFAULT_POSITION
-#define FOC_PORT_DEFAULT_POSITION \
-    { .ptOps = NULL, .pContext = NULL }
-#endif
 
 typedef enum {
     FOC_CALIBRATION_BUSY = 0,

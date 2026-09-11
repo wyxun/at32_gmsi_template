@@ -13,8 +13,6 @@
 #include <stdint.h>
 
 #include "userconfig.h"
-#include "foc_angle.h"
-#include "foc_encoder.h"
 #include "haladc.h"
 #include "haltim1.h"
 #include "mdi_hw.h"
@@ -213,53 +211,25 @@ const foc_adc_ops_t g_tFocAdcOps = {
 };
 
 #if defined(MDI_HW_HAS_I2C_ENCODER)
-as5600_sensor_t g_tFocPositionSensor;
+as5600_t g_tFocAs5600;
 
-static foc_result_t foc_port_As5600Init(
-    void *pContext,
-    const motor_params_t *ptMotor,
-    foc_scalar_t qHighFrequencyPeriod,
-    const foc_encoder_params_t *ptEncoderParams)
+int32_t foc_port_As5600Init(void *pContext)
 {
-    as5600_sensor_t *ptSensor = (as5600_sensor_t *)pContext;
+    as5600_t *ptAs5600 = (as5600_t *)pContext;
 
-    if (ptSensor == NULL || HW.ptI2c1 == NULL || ptEncoderParams == NULL) {
-        return FOC_RESULT_INVALID_ARGUMENT;
+    if (ptAs5600 == NULL || HW.ptI2c1 == NULL) {
+        return -1;
     }
-    if (as5600_sensor_Init(ptSensor, HW.ptI2c1) != 0) {
-        return FOC_RESULT_INVALID_ARGUMENT;
+    return as5600_Init(ptAs5600, HW.ptI2c1);
+}
+
+int32_t foc_port_As5600Read(void *pContext,
+                            uint16_t *phwRawAngle)
+{
+    if (pContext == NULL || phwRawAngle == NULL) {
+        return -1;
     }
-    return g_tAs5600PositionOps.fnInit(
-        ptSensor, ptMotor, qHighFrequencyPeriod, ptEncoderParams);
+    return as5600_ReadMechanicalAngle((as5600_t *)pContext, phwRawAngle);
 }
-
-static void foc_port_PositionReset(void *pContext)
-{
-    g_tAs5600PositionOps.fnReset(pContext);
-}
-
-static foc_result_t foc_port_PositionPoll(void *pContext)
-{
-    return g_tAs5600PositionOps.fnPoll(pContext);
-}
-
-static foc_result_t foc_port_PositionRead(
-    void *pContext, motor_position_feedback_t *ptFeedback)
-{
-    return g_tAs5600PositionOps.fnReadFeedback(pContext, ptFeedback);
-}
-
-static foc_result_t foc_port_PositionCaptureZero(void *pContext)
-{
-    return g_tAs5600PositionOps.fnCaptureZero(pContext);
-}
-
-const motor_position_ops_t g_tFocPositionOps = {
-    .fnInit = foc_port_As5600Init,
-    .fnReset = foc_port_PositionReset,
-    .fnPoll = foc_port_PositionPoll,
-    .fnReadFeedback = foc_port_PositionRead,
-    .fnCaptureZero = foc_port_PositionCaptureZero,
-};
 
 #endif

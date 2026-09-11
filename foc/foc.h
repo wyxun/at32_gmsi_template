@@ -15,7 +15,6 @@
 #include "control/foc_pid.h"
 #include "modulation/foc_modulation.h"
 #include "observer/foc_encoder.h"
-#include "motor/motor_position.h"
 #include "motor/motor.h"
 
 #include "app/foc_app.h"
